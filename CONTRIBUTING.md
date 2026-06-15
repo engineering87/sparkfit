@@ -19,10 +19,11 @@ pip install -e ".[dev]"
 
 ```bash
 ruff check .      # lint
+mypy src          # type check
 pytest -q         # tests
 ```
 
-Both run in CI on Python 3.8 to 3.12, so please make sure they pass locally before
+All three run in CI on Python 3.8 to 3.12, so please make sure they pass locally before
 opening a pull request.
 
 ## Adding a model to the built-in database

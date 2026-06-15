@@ -38,7 +38,7 @@ __version__ = "0.1.0"
 GB = 1_000_000_000  # decimal GB, matches NVIDIA's "128 GB" and common LLM rules
 
 # DGX Spark (GB10 Grace Blackwell) reference profile. Override via flags.
-SPARK = {
+SPARK: dict = {
     "name": "NVIDIA DGX Spark (GB10)",
     "total_mem_gb": 128.0,      # advertised unified LPDDR5x
     "bandwidth_gbps": 273.0,    # 273 GB/s shared CPU+GPU, the real bottleneck
@@ -75,7 +75,7 @@ KV_BYTES = {"fp16": 2.0, "bf16": 2.0, "fp8": 1.0, "int8": 1.0, "q4": 0.5}
 
 # Built-in model database. Architecture fields drive accurate KV-cache math.
 # total_b / active_b in billions of params (active < total only for MoE).
-MODELS = {
+MODELS: dict[str, dict] = {
     "llama3.2-1b":   dict(total_b=1.24,  active_b=1.24,  layers=16, hidden=2048,  kv_heads=8,  head_dim=64),
     "llama3.2-3b":   dict(total_b=3.21,  active_b=3.21,  layers=28, hidden=3072,  kv_heads=8,  head_dim=128),
     "llama3.1-8b":   dict(total_b=8.03,  active_b=8.03,  layers=32, hidden=4096,  kv_heads=8,  head_dim=128),

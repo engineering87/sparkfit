@@ -133,3 +133,65 @@ def test_deepseek_catalog_entry_uses_mla():
     # latent cache stays tiny even at long context
     kv = sf.kv_total_bytes(spec, context=8192, batch=1)
     assert kv < 2 * 1e9  # under 2 GB for 8k context
+
+
+# --- CLI integration tests (exercise command handlers and rendering) ---
+
+def test_cli_models(capsys):
+    sf.main(["models"])
+    assert "llama3.1-70b" in capsys.readouterr().out
+
+
+def test_cli_quick_report(capsys):
+    sf.main(["llama3.1-8b"])
+    out = capsys.readouterr().out
+    assert "FITS" in out and "tok/s per stream" in out
+
+
+def test_cli_plan_json(capsys):
+    sf.main(["plan", "-m", "llama3.1-8b", "-q", "q4_k_m", "--json"])
+    import json
+    data = json.loads(capsys.readouterr().out)
+    assert data["fits"] is True
+    assert data["model"]["name"] == "llama3.1-8b"
+
+
+def test_cli_advise(capsys):
+    sf.main(["advise", "-m", "qwen2.5-72b", "-c", "16384"])
+    assert "Use" in capsys.readouterr().out
+
+
+def test_cli_fit_scan_db(capsys):
+    sf.main(["fit", "-q", "q4_k_m", "-c", "4096"])
+    assert "Largest model that fits" in capsys.readouterr().out
+
+
+def test_cli_fit_concurrency_scan(capsys):
+    sf.main(["fit", "-m", "llama3.1-8b", "-q", "q4_k_m", "--concurrency-scan"])
+    assert "concurrent stream" in capsys.readouterr().out
+
+
+def test_cli_quick_deepseek_mla(capsys):
+    sf.main(["deepseek-v2-lite", "-c", "8192"])
+    assert "MoE" in capsys.readouterr().out
+
+
+def test_cli_scan_json(capsys):
+    sf.main(["scan", "--json"])
+    import json
+    json.loads(capsys.readouterr().out)  # valid JSON, no exception
+
+
+def test_cli_version():
+    with pytest.raises(SystemExit):
+        sf.main(["--version"])
+
+
+def test_cli_unknown_model_errors():
+    with pytest.raises(SystemExit):
+        sf.main(["totally-unknown-model-xyz"])
+
+
+def test_cli_no_args_prints_help(capsys):
+    sf.main([])
+    assert "usage" in capsys.readouterr().out.lower()
