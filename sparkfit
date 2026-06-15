@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# sparkfit launcher - DGX Spark LLM capacity planner
+# Put this on your PATH (e.g. /usr/local/bin) next to the src/ directory, or symlink it.
+set -euo pipefail
+DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+PY="$(command -v python3 || command -v python)"
+exec "$PY" "$DIR/src/sparkfit.py" "$@"

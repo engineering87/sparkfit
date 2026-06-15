@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sparkfit"
+version = "0.1.0"
+description = "LLM memory capacity planner for the NVIDIA DGX Spark (unified-memory & bandwidth aware)."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [{ name = "engineering87" }]
+keywords = ["dgx-spark", "llm", "capacity-planning", "gb10", "inference", "vram", "quantization"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: System :: Hardware",
+]
+dependencies = []  # standard library only
+
+[project.urls]
+Homepage = "https://github.com/engineering87/sparkfit"
+Repository = "https://github.com/engineering87/sparkfit"
+Issues = "https://github.com/engineering87/sparkfit/issues"
+
+[project.scripts]
+sparkfit = "sparkfit:main"
+
+[project.optional-dependencies]
+dev = ["pytest>=7", "ruff>=0.4"]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+py-modules = ["sparkfit"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py38"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

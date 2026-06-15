@@ -1,0 +1,11 @@
+<svg viewBox="0 0 560 168" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="sparkfit">
+  <g transform="translate(16,20)">
+    <rect x="14" y="98" width="16" height="20" rx="4" fill="#76B900"/>
+    <rect x="35" y="98" width="16" height="20" rx="4" fill="#76B900"/>
+    <rect x="56" y="98" width="16" height="20" rx="4" fill="#76B900"/>
+    <rect x="77" y="98" width="16" height="20" rx="4" fill="#E3E8EF"/>
+    <rect x="98" y="98" width="16" height="20" rx="4" fill="#E3E8EF"/>
+    <path d="M70 8 L30 56 L66 56 L62 88 L102 40 L66 40 Z" fill="#76B900" stroke="#ffffff" stroke-width="3" stroke-linejoin="round"/>
+  </g>
+  <text x="172" y="108" font-family="Arial, Helvetica, sans-serif" font-size="66" font-weight="800" letter-spacing="-1"><tspan fill="#76B900">spark</tspan><tspan fill="#1F2933">fit</tspan></text>
+</svg>

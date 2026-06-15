@@ -1,0 +1,9 @@
+<svg viewBox="0 0 128 128" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="sparkfit icon">
+  <rect width="128" height="128" rx="28" fill="#0D1117"/>
+  <rect x="14" y="96" width="16" height="20" rx="4" fill="#76B900"/>
+  <rect x="35" y="96" width="16" height="20" rx="4" fill="#76B900"/>
+  <rect x="56" y="96" width="16" height="20" rx="4" fill="#76B900"/>
+  <rect x="77" y="96" width="16" height="20" rx="4" fill="#2A313B"/>
+  <rect x="98" y="96" width="16" height="20" rx="4" fill="#2A313B"/>
+  <path d="M70 8 L30 56 L66 56 L62 86 L102 40 L66 40 Z" fill="#76B900" stroke="#0D1117" stroke-width="3" stroke-linejoin="round"/>
+</svg>
