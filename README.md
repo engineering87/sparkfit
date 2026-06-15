@@ -114,33 +114,79 @@ scripting).
 
 `-q/--quant` (default `q4_k_m` for `plan`, `advise`, `fit`; auto in quick mode),
 `-c/--context`, `-b/--batch`, `-n/--concurrency`,
-`--kv-dtype {fp16,fp8,int8,q4}`, `--os-reserve` (GB, default 8),
+`--kv-dtype {fp16,bf16,fp8,int8,q4}`, `--os-reserve` (GB, default 8),
 `--framework` (GB, default 2), `--total-mem`, `--bandwidth`, `--live`, `--json`.
 For models not in the DB: `--params --active --layers --hidden --kv-heads --head-dim`.
 
 ## Methodology
 
 All assumptions are explicit constants near the top of `src/sparkfit.py` and can be
-overridden from the command line.
+overridden from the command line. Everything below is plain arithmetic, not a
+benchmark, so you can audit it and change any assumption.
 
-- Weights = `params * bits_per_weight / 8`. The `QUANT_BITS` table includes the
-  real overhead of GGUF formats (for example `q4_k_m` is about 4.85 bits, not
-  4.0).
-- KV-cache per token = `2 * layers * kv_heads * head_dim * dtype_bytes` (models
-  GQA via `kv_heads`); total = times context times streams.
-- Decode speed (roofline): token generation is memory-bound. Each step streams the
-  weights once (active weights only, for MoE) plus the whole KV-cache, so
-  `tok/s ~= bandwidth * efficiency / bytes_per_step`, with a default 70% of
-  273 GB/s. Prefill/compute-bound time is not modeled (Spark is fast at prefill;
-  the practical limit is decode).
-- OS and framework reserve: on unified memory the CPU and GPU draw from the same
-  pool, so by default 8 GB (OS/DGX plus the Grace side) and 2 GB (CUDA context
-  plus serving framework) are reserved. Both are adjustable; `--live` sets the OS
-  reserve to 0 because the live-free figure already excludes it.
-- Hugging Face auto-fetch reads `config.json` and estimates parameters from the
-  architecture (embeddings, attention, MLP/MoE). Validated against real configs:
-  Qwen2.5-7B gives 7.62B (actual 7.61B), Mixtral-8x7B gives 46.7B total and 12.9B
-  active.
+### Memory budget
+
+```
+streams      = batch * concurrency
+weights      = params_B * 1e9 * bits_per_weight / 8
+kv_cache     = kv_per_token * context * streams
+activations  = streams * context * hidden * 2 * 2      # two fp16 work buffers
+used         = weights + kv_cache + activations + os_reserve + framework
+fits         = used <= total_memory
+```
+
+`bits_per_weight` comes from the `QUANT_BITS` table, which uses the real on-disk
+width of each format (for example `q4_k_m` is 4.85 bits, not 4.0; `fp16` is 16).
+Sizes use decimal GB (1e9), matching how the 128 GB is advertised.
+
+### KV-cache per token
+
+Standard attention (MHA, or grouped-query GQA):
+
+```
+kv_per_token = 2 * layers * kv_heads * head_dim * dtype_bytes
+```
+
+The 2 is for K and V; GQA is captured by `kv_heads` being smaller than the number
+of attention heads. `dtype_bytes` is 2 for fp16, 1 for fp8/int8, 0.5 for 4-bit.
+
+Multi-head Latent Attention (MLA, DeepSeek V2/V3/R1) stores one compressed latent
+per layer instead of per-head K and V:
+
+```
+kv_per_token = layers * (kv_lora_rank + qk_rope_head_dim) * dtype_bytes
+```
+
+This is much smaller. For DeepSeek-R1 at 8k context it is about 0.6 GB, versus tens
+of GB for a naive per-head estimate.
+
+### Decode speed (roofline)
+
+Token generation is memory-bound: each step reads the active weights once plus the
+resident KV-cache. With a fraction `eff` of peak bandwidth actually reached:
+
+```
+bytes_per_step    = active_weights + kv_per_token * context * batch
+tok_s_per_stream  = bandwidth * eff / bytes_per_step
+```
+
+Defaults: `bandwidth` 273 GB/s, `eff` 0.70. For MoE only the active parameters are
+read, which is why a large MoE can be far faster than its total size suggests.
+Prefill (compute-bound) time is not modeled; on Spark the practical limit is
+decode.
+
+### Reserves and parameter estimation
+
+On unified memory the CPU and GPU share one pool, so by default 8 GB (OS/DGX plus
+the Grace side) and 2 GB (CUDA context plus serving framework) are held back. Both
+are adjustable; `--live` sets the OS reserve to 0 because the live-free figure
+already excludes it.
+
+For Hugging Face auto-fetch, parameters are estimated from `config.json` by summing
+embeddings, attention projections, and the MLP or expert layers (including MLA
+projections and DeepSeek fine-grained MoE). Validated against real configs:
+Qwen2.5-7B gives 7.62B (actual 7.61B), Mixtral-8x7B gives 46.7B total and 12.9B
+active, and DeepSeek-V3 gives about 671B total and 37B active.
 
 These are capacity-planning estimates, not measurements. For exact numbers,
 cross-check with `sparkfit scan` on the real machine.
