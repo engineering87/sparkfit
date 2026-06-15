@@ -82,3 +82,54 @@ def test_resolve_db_name_fuzzy():
 def test_resolve_db_name_ambiguous():
     with pytest.raises(SystemExit):
         sf.resolve_db_name("qwen2.5")  # matches several
+
+
+def test_parse_hf_mla_deepseek_v2_lite():
+    cfg = {
+        "hidden_size": 2048, "intermediate_size": 10944, "num_hidden_layers": 27,
+        "num_attention_heads": 16, "num_key_value_heads": 16, "vocab_size": 102400,
+        "kv_lora_rank": 512, "qk_rope_head_dim": 64, "qk_nope_head_dim": 128,
+        "v_head_dim": 128, "q_lora_rank": None, "n_routed_experts": 64,
+        "num_experts_per_tok": 6, "n_shared_experts": 2, "moe_intermediate_size": 1408,
+        "first_k_dense_replace": 1, "tie_word_embeddings": False,
+    }
+    spec = sf.parse_hf_config(cfg)
+    assert spec["kv_style"] == "mla"
+    assert spec["mla_dim"] == 576
+    assert spec["moe"] is True
+    assert spec["total_b"] == pytest.approx(15.7, abs=0.6)  # real ~15.7B
+
+
+def test_parse_hf_mla_deepseek_v3():
+    cfg = {
+        "hidden_size": 7168, "intermediate_size": 18432, "num_hidden_layers": 61,
+        "num_attention_heads": 128, "num_key_value_heads": 128, "vocab_size": 129280,
+        "kv_lora_rank": 512, "qk_rope_head_dim": 64, "qk_nope_head_dim": 128,
+        "v_head_dim": 128, "q_lora_rank": 1536, "n_routed_experts": 256,
+        "num_experts_per_tok": 8, "n_shared_experts": 1, "moe_intermediate_size": 2048,
+        "first_k_dense_replace": 3, "tie_word_embeddings": False,
+    }
+    spec = sf.parse_hf_config(cfg)
+    assert spec["total_b"] == pytest.approx(671, abs=15)   # real 671B
+    assert spec["active_b"] == pytest.approx(37, abs=4)    # real ~37B
+
+
+def test_mla_kv_much_smaller_than_mha():
+    spec = sf.parse_hf_config({
+        "hidden_size": 7168, "num_hidden_layers": 61, "num_attention_heads": 128,
+        "num_key_value_heads": 128, "vocab_size": 129280, "kv_lora_rank": 512,
+        "qk_rope_head_dim": 64, "qk_nope_head_dim": 128, "v_head_dim": 128,
+        "q_lora_rank": 1536, "intermediate_size": 18432,
+    })
+    mla = sf.kv_per_token_bytes(spec, "fp16")
+    naive = 2 * spec["layers"] * spec["kv_heads"] * spec["head_dim"] * 2
+    assert mla == 61 * 576 * 2
+    assert mla < naive / 5
+
+
+def test_deepseek_catalog_entry_uses_mla():
+    spec = dict(sf.MODELS["deepseek-r1"])
+    assert spec.get("kv_style") == "mla"
+    # latent cache stays tiny even at long context
+    kv = sf.kv_total_bytes(spec, context=8192, batch=1)
+    assert kv < 2 * 1e9  # under 2 GB for 8k context

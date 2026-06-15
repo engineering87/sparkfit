@@ -91,6 +91,8 @@ MODELS = {
     "gemma2-27b":    dict(total_b=27.2,  active_b=27.2,  layers=46, hidden=4608,  kv_heads=16, head_dim=128),
     "gpt-oss-20b":   dict(total_b=21.0,  active_b=3.6,   layers=24, hidden=2880,  kv_heads=8,  head_dim=64,  moe=True),
     "gpt-oss-120b":  dict(total_b=117.0, active_b=5.1,   layers=36, hidden=2880,  kv_heads=8,  head_dim=64,  moe=True),
+    "deepseek-v2-lite": dict(total_b=15.7,  active_b=2.4,  layers=27, hidden=2048, kv_heads=16,  head_dim=128, moe=True, kv_style="mla", mla_dim=576),
+    "deepseek-r1":      dict(total_b=671.0, active_b=37.0, layers=61, hidden=7168, kv_heads=128, head_dim=128, moe=True, kv_style="mla", mla_dim=576),
 }
 
 # ---------------------------------------------------------------------------
@@ -153,7 +155,13 @@ def weight_bytes(params_b: float, quant: str) -> float:
 
 
 def kv_per_token_bytes(spec: dict, kv_dtype: str = "fp16") -> float:
-    """Bytes of KV-cache consumed per generated token, per sequence."""
+    """Bytes of KV-cache consumed per generated token, per sequence.
+
+    MLA models (DeepSeek V2/V3/R1) keep one compressed latent per layer instead
+    of per-head K/V, so their cache is far smaller than a standard MHA/GQA model.
+    """
+    if spec.get("kv_style") == "mla":
+        return spec["layers"] * spec["mla_dim"] * KV_BYTES[kv_dtype]
     return 2 * spec["layers"] * spec["kv_heads"] * spec["head_dim"] * KV_BYTES[kv_dtype]
 
 
@@ -343,7 +351,11 @@ def _mlp_params(hidden: int, inter: int) -> int:
 
 
 def parse_hf_config(cfg: dict) -> dict:
-    """Build a best-effort sparkfit spec from a HF transformers config.json dict."""
+    """Build a best-effort sparkfit spec from a HF transformers config.json dict.
+
+    Handles dense, Mixture-of-Experts, and Multi-head Latent Attention (MLA,
+    DeepSeek V2/V3/R1) architectures.
+    """
     g = cfg.get
     hidden = g("hidden_size") or g("n_embd")
     layers = g("num_hidden_layers") or g("n_layer")
@@ -357,32 +369,66 @@ def parse_hf_config(cfg: dict) -> dict:
     vocab = g("vocab_size") or 32000
     inter = g("intermediate_size") or (4 * hidden)
     tie = bool(g("tie_word_embeddings"))
-    # Attention parameters per layer: q, k+v, o projections.
-    q = hidden * heads * head_dim
-    kv = 2 * hidden * kv_heads * head_dim
-    o = heads * head_dim * hidden
-    attn = q + kv + o
-    # MLP, dense or Mixture-of-Experts.
-    n_exp = g("num_local_experts") or g("num_experts") or 0
+
+    # Attention parameters per layer, and the KV-cache style.
+    kv_lora = g("kv_lora_rank")
+    if kv_lora:
+        # Multi-head Latent Attention: compressed latent KV cache (DeepSeek).
+        qk_rope = g("qk_rope_head_dim") or 0
+        qk_nope = g("qk_nope_head_dim") or head_dim
+        v_head = g("v_head_dim") or head_dim
+        q_lora = g("q_lora_rank")
+        if q_lora:
+            q = hidden * q_lora + q_lora * heads * (qk_nope + qk_rope)
+        else:
+            q = hidden * heads * (qk_nope + qk_rope)
+        kv_down = hidden * (kv_lora + qk_rope)
+        kv_up = kv_lora * heads * (qk_nope + v_head)
+        o = heads * v_head * hidden
+        attn = q + kv_down + kv_up + o
+        kv_style = "mla"
+        mla_dim = kv_lora + qk_rope
+    else:
+        q = hidden * heads * head_dim
+        kv = 2 * hidden * kv_heads * head_dim
+        o = heads * head_dim * hidden
+        attn = q + kv + o
+        kv_style = "mha"
+        mla_dim = 0
+
+    # MLP per layer: dense, or Mixture-of-Experts (incl. DeepSeek fine-grained).
+    n_exp = g("num_local_experts") or g("num_experts") or g("n_routed_experts") or 0
     top = g("num_experts_per_tok") or 0
-    moe_inter = g("moe_intermediate_size") or inter
     if n_exp and top:
-        mlp_total = n_exp * _mlp_params(hidden, moe_inter)
-        mlp_active = top * _mlp_params(hidden, moe_inter)
-        shared = g("shared_expert_intermediate_size")
-        if shared:
-            mlp_total += _mlp_params(hidden, shared)
-            mlp_active += _mlp_params(hidden, shared)
+        moe_inter = g("moe_intermediate_size") or inter
+        first_dense = g("first_k_dense_replace") or 0
+        moe_layers = max(layers - first_dense, 0)
+        shared = (g("n_shared_experts") or 0) * _mlp_params(hidden, moe_inter)
+        shared_inter = g("shared_expert_intermediate_size")
+        if shared_inter:  # Qwen2-MoE style single shared expert
+            shared += _mlp_params(hidden, shared_inter)
+        router = hidden * n_exp
+        routed_total = n_exp * _mlp_params(hidden, moe_inter)
+        routed_active = top * _mlp_params(hidden, moe_inter)
+        dense_mlp = first_dense * _mlp_params(hidden, inter)
+        mlp_total = dense_mlp + moe_layers * (routed_total + shared + router)
+        mlp_active = dense_mlp + moe_layers * (routed_active + shared + router)
         moe = True
     else:
-        mlp_total = mlp_active = _mlp_params(hidden, inter)
+        mlp_total = mlp_active = layers * _mlp_params(hidden, inter)
         moe = False
+
     embed = vocab * hidden
     lm_head = 0 if tie else vocab * hidden
-    total = embed + lm_head + layers * (attn + mlp_total)
-    active = embed + lm_head + layers * (attn + mlp_active)
-    return {"total_b": total / 1e9, "active_b": active / 1e9, "layers": layers,
+    attn_sum = layers * attn
+    total = embed + lm_head + attn_sum + mlp_total
+    active = embed + lm_head + attn_sum + mlp_active
+    spec = {"total_b": total / 1e9, "active_b": active / 1e9, "layers": layers,
             "hidden": hidden, "kv_heads": kv_heads, "head_dim": head_dim, "moe": moe}
+    if kv_style == "mla":
+        spec["kv_style"] = "mla"
+        spec["mla_dim"] = mla_dim
+    return spec
 
 
 def fetch_hf_config(repo_id: str, revision: str = "main") -> dict:

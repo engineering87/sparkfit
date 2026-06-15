@@ -6,6 +6,15 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- Multi-head Latent Attention (MLA) support for DeepSeek V2/V3/R1: the KV-cache is
+  modeled as a compressed latent (`kv_lora_rank + qk_rope_head_dim`) per layer,
+  fixing a large overestimation of the per-head formula.
+- Parameter estimation for DeepSeek fine-grained MoE (routed and shared experts,
+  `first_k_dense_replace` dense prefix) and MLA attention projections. Validated:
+  DeepSeek-V2-Lite ~15.7B, DeepSeek-V3 ~671B total / ~37B active.
+- Built-in catalog entries `deepseek-v2-lite` and `deepseek-r1`.
+
 ## [0.1.0] - 2026-06-15
 
 ### Added
