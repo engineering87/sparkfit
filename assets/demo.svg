@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 701" width="720" height="701" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13" role="img" aria-label="sparkfit terminal demo planning llama3.1-70b on a DGX Spark">
+<title>sparkfit terminal demo</title>
+<desc>Running sparkfit llama3.1-70b shows the unified-memory budget, a FITS verdict with 44 GB headroom, an estimated 2.6 tokens/s decode speed, and a table of alternative quantizations.</desc>
+<rect x="0" y="0" width="720" height="701" rx="10" fill="#15191e"/>
+<rect x="0" y="0" width="720" height="30" fill="#222a33"/>
+<rect x="0" y="20" width="720" height="10" fill="#222a33"/>
+<circle cx="18" cy="15" r="5" fill="#ff5f57"/><circle cx="36" cy="15" r="5" fill="#febc2e"/><circle cx="54" cy="15" r="5" fill="#28c840"/>
+<text x="360" y="19" text-anchor="middle" fill="#7d8794" font-size="12" font-family="ui-monospace, monospace">sparkfit</text>
+<text x="20" y="58" xml:space="preserve"><tspan fill="#84c020">dgxspark@spark-a852</tspan><tspan fill="#cdd6e0">:</tspan><tspan fill="#5aa9f0">~/sparkfit</tspan><tspan fill="#cdd6e0">$ </tspan><tspan fill="#eef3f8">sparkfit llama3.1-70b</tspan></text>
+<text x="20" y="99" xml:space="preserve"><tspan fill="#eef3f8">  NVIDIA DGX Spark (GB10)  |  llama3.1-70b  |  fp8 (auto)  |  ctx 8192</tspan></text>
+<text x="20" y="120" xml:space="preserve"><tspan fill="#7d8794">  71B params | 80 layers | hidden 8192 | kv_heads 8 | [built-in]</tspan></text>
+<text x="20" y="160" xml:space="preserve"><tspan fill="#cdd6e0">  Weights           70.6 GB  </tspan><tspan fill="#84c020">██████████████████</tspan><tspan fill="#39414c">░░░░░░░░░░░░░░</tspan></text>
+<text x="20" y="181" xml:space="preserve"><tspan fill="#cdd6e0">  KV-cache           2.7 GB  </tspan><tspan fill="#84c020">█</tspan><tspan fill="#39414c">░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░</tspan></text>
+<text x="20" y="202" xml:space="preserve"><tspan fill="#cdd6e0">  Activations        0.3 GB  </tspan><tspan fill="#39414c">░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░</tspan></text>
+<text x="20" y="222" xml:space="preserve"><tspan fill="#cdd6e0">  OS reserve         8.0 GB  </tspan><tspan fill="#84c020">██</tspan><tspan fill="#39414c">░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░</tspan></text>
+<text x="20" y="242" xml:space="preserve"><tspan fill="#cdd6e0">  CUDA/framework     2.0 GB  </tspan><tspan fill="#39414c">░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░</tspan></text>
+<text x="20" y="263" xml:space="preserve"><tspan fill="#7d8794">  ────────────────────────────────────────────────────────</tspan></text>
+<text x="20" y="284" xml:space="preserve"><tspan fill="#cdd6e0">  USED              83.6 GB  </tspan><tspan fill="#84c020">█████████████████████</tspan><tspan fill="#39414c">░░░░░░░░░░░</tspan><tspan fill="#cdd6e0"> 65.3%</tspan></text>
+<text x="20" y="304" xml:space="preserve"><tspan fill="#cdd6e0">  of               128.0 GB</tspan></text>
+<text x="20" y="345" xml:space="preserve"><tspan fill="#cdd6e0">  </tspan><tspan fill="#84c020">✓</tspan><tspan fill="#cdd6e0"> FITS  | 44.4 GB headroom</tspan></text>
+<text x="20" y="386" xml:space="preserve"><tspan fill="#eef3f8">  Decode speed (memory-bandwidth roofline)</tspan></text>
+<text x="20" y="406" xml:space="preserve"><tspan fill="#cdd6e0">       2.6 tok/s per stream</tspan></text>
+<text x="20" y="427" xml:space="preserve"><tspan fill="#cdd6e0">    feel: </tspan><tspan fill="#f0796a">slow - bandwidth bound</tspan></text>
+<text x="20" y="468" xml:space="preserve"><tspan fill="#eef3f8">  Other quantizations</tspan></text>
+<text x="20" y="488" xml:space="preserve"><tspan fill="#cdd6e0">    fp16       154G  </tspan><tspan fill="#f0796a">✗</tspan><tspan fill="#cdd6e0">    1 tok/s</tspan></text>
+<text x="20" y="509" xml:space="preserve"><tspan fill="#cdd6e0">    fp8         84G  </tspan><tspan fill="#84c020">✓</tspan><tspan fill="#cdd6e0">    3 tok/s  (selected)</tspan></text>
+<text x="20" y="530" xml:space="preserve"><tspan fill="#cdd6e0">    q6_k        71G  </tspan><tspan fill="#84c020">✓</tspan><tspan fill="#cdd6e0">    3 tok/s</tspan></text>
+<text x="20" y="550" xml:space="preserve"><tspan fill="#cdd6e0">    q5_k_m      61G  </tspan><tspan fill="#84c020">✓</tspan><tspan fill="#cdd6e0">    4 tok/s</tspan></text>
+<text x="20" y="570" xml:space="preserve"><tspan fill="#cdd6e0">    q4_k_m      56G  </tspan><tspan fill="#84c020">✓</tspan><tspan fill="#cdd6e0">    4 tok/s</tspan></text>
+<text x="20" y="591" xml:space="preserve"><tspan fill="#cdd6e0">    nvfp4       50G  </tspan><tspan fill="#84c020">✓</tspan><tspan fill="#cdd6e0">    5 tok/s</tspan></text>
+<text x="20" y="612" xml:space="preserve"><tspan fill="#cdd6e0">    q3_k_m      47G  </tspan><tspan fill="#84c020">✓</tspan><tspan fill="#cdd6e0">    5 tok/s</tspan></text>
+<text x="20" y="632" xml:space="preserve"><tspan fill="#cdd6e0">    q2_k        43G  </tspan><tspan fill="#84c020">✓</tspan><tspan fill="#cdd6e0">    6 tok/s</tspan></text>
+<text x="20" y="673" xml:space="preserve"><tspan fill="#7d8794">  tip: add -c 16384, -n 4 or -q q5_k_m to customize  |  full table: sparkfit advise -m llama3.1-70b</tspan></text>
+</svg>

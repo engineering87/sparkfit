@@ -34,16 +34,24 @@ Pure Python standard library. No dependencies.
 
 ## Install
 
-With [pipx](https://pipx.pypa.io/) (recommended; isolated, global `sparkfit`
-command):
+sparkfit is a CLI, so [pipx](https://pipx.pypa.io/) is the cleanest way to install
+it (isolated environment, global `sparkfit` command):
 
 ```bash
 pipx install git+https://github.com/engineering87/sparkfit.git
 ```
 
-Or with pip:
+On a fresh DGX Spark (DGX OS) you may need pipx first. Note that a plain
+system-wide `pip install` is blocked by PEP 668 on these systems:
 
 ```bash
+sudo apt install -y pipx && pipx ensurepath   # then restart the shell
+```
+
+Plain pip works inside a virtual environment:
+
+```bash
+python3 -m venv .venv && . .venv/bin/activate
 pip install git+https://github.com/engineering87/sparkfit.git
 ```
 
@@ -69,25 +77,9 @@ sparkfit 72b                   # even a fragment works
 sparkfit Qwen/Qwen2.5-7B       # Hugging Face id -> reads params online
 ```
 
-```text
-  NVIDIA DGX Spark (GB10)  |  llama3.1-70b  |  fp8 (auto)  |  ctx 8192
-  71B params | 80 layers | hidden 8192 | kv_heads 8 | [built-in]
-
-  Weights           70.6 GB  ██████████████████░░░░░░░░░░░░░░
-  KV-cache           2.7 GB  █░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
-  Activations        0.3 GB  ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
-  OS reserve         8.0 GB  ██░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
-  CUDA/framework     2.0 GB  ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
-  --------------------------------------------------------
-  USED              83.6 GB  █████████████████████░░░░░░░░░░░ 65.3%
-  of               128.0 GB
-
-  ✓ FITS  | 44.4 GB headroom
-
-  Decode speed (memory-bandwidth roofline)
-       2.6 tok/s per stream
-    feel: slow - bandwidth bound
-```
+<p align="center">
+  <img alt="sparkfit planning llama3.1-70b on a DGX Spark" src="assets/demo.svg" width="720">
+</p>
 
 Override any default: `sparkfit qwen2.5-72b -c 16384 -n 4 -q q5_k_m`.
 
