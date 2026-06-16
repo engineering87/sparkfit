@@ -6,6 +6,11 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- `--efficiency` flag and `SPARKFIT_EFFICIENCY` / `SPARKFIT_BANDWIDTH` /
+  `SPARKFIT_OS_RESERVE` / `SPARKFIT_FRAMEWORK` environment overrides, so estimates
+  can be calibrated to a measured device.
+
 ### Fixed
 - `--total-mem` now rejects zero or negative values with a clear error message
   instead of raising an unhandled exception.

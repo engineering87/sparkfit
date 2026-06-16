@@ -115,7 +115,7 @@ scripting).
 `-q/--quant` (default `q4_k_m` for `plan`, `advise`, `fit`; auto in quick mode),
 `-c/--context`, `-b/--batch`, `-n/--concurrency`,
 `--kv-dtype {fp16,bf16,fp8,int8,q4}`, `--os-reserve` (GB, default 8),
-`--framework` (GB, default 2), `--total-mem`, `--bandwidth`, `--live`, `--json`.
+`--framework` (GB, default 2), `--total-mem`, `--bandwidth`, `--efficiency` (default 0.70), `--live`, `--json`.
 For models not in the DB: `--params --active --layers --hidden --kv-heads --head-dim`.
 
 ## Methodology
@@ -187,6 +187,44 @@ embeddings, attention projections, and the MLP or expert layers (including MLA
 projections and DeepSeek fine-grained MoE). Validated against real configs:
 Qwen2.5-7B gives 7.62B (actual 7.61B), Mixtral-8x7B gives 46.7B total and 12.9B
 active, and DeepSeek-V3 gives about 671B total and 37B active.
+
+### Calibrating to your device
+
+The defaults (70% bandwidth efficiency, 8 GB OS reserve, 2 GB framework) are
+conservative starting points. If you measure real numbers on your Spark, plug them
+in per run with `--efficiency`, `--bandwidth`, `--os-reserve`, `--framework`, or set
+them once via environment variables so they stick:
+
+```bash
+export SPARKFIT_EFFICIENCY=0.6     # measured decode tok/s divided by the roofline
+export SPARKFIT_OS_RESERVE=10
+sparkfit llama3.1-8b
+```
+
+To calibrate efficiency, run a known model on your serving stack, note the real
+decode tok/s, and divide by what sparkfit predicts at `--efficiency 1.0`.
+
+
+A robust, architecture-independent shortcut is
+`efficiency ~= measured_tok_s * weights_GB / 273`, where `weights_GB` is the
+on-disk size of the weight files. Measured example: a DGX Spark serving an FP8
+model under vLLM (no other load) reached 6.8 tok/s against 35.9 GB of weights,
+i.e. about 0.85 efficiency, well above the conservative 0.70 default.
+
+### Validation on a real DGX Spark
+
+Measured on a DGX Spark serving FP8 models with vLLM:
+
+- Bandwidth efficiency: a single stream reached 6.8 tok/s on 35.9 GB of
+  weights, about 0.85 to 0.89 of the 273 GB/s roofline (the 0.70 default is
+  conservative).
+- Concurrency: aggregate throughput scaled almost linearly to 8 parallel
+  streams (6.8, 13.5, 26.4, 51.9 tok/s; per-stream 6.8 down to 6.5), matching
+  sparkfit's batched-decode model within about 5%.
+- Contention: co-serving a second model (a 4B embedding model under load) on
+  the same unified memory cut the generator from 6.8 to 3.8 tok/s. sparkfit
+  assumes a model gets the full 273 GB/s, so when you co-serve, model your
+  share by lowering `--bandwidth` or `--efficiency`.
 
 These are capacity-planning estimates, not measurements. For exact numbers,
 cross-check with `sparkfit scan` on the real machine.

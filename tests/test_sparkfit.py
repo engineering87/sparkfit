@@ -205,3 +205,22 @@ def test_total_mem_zero_errors():
 def test_total_mem_negative_errors():
     with pytest.raises(SystemExit):
         sf.budget(sf.MODELS["llama3.1-8b"], "q4_k_m", 4096, 1, total_mem=-5)
+
+
+def test_efficiency_flag_scales_tok_s(capsys):
+    import json
+    sf.main(["plan", "-m", "llama3.1-8b", "-q", "q4_k_m", "--efficiency", "0.35", "--json"])
+    low = json.loads(capsys.readouterr().out)["decode_tok_s"]["per_stream"]
+    sf.main(["plan", "-m", "llama3.1-8b", "-q", "q4_k_m", "--efficiency", "0.70", "--json"])
+    high = json.loads(capsys.readouterr().out)["decode_tok_s"]["per_stream"]
+    assert high == pytest.approx(2 * low, rel=0.02)
+
+
+def test_env_efficiency_overrides_default(capsys, monkeypatch):
+    import json
+    sf.main(["plan", "-m", "llama3.1-8b", "-q", "q4_k_m", "--json"])
+    base = json.loads(capsys.readouterr().out)["decode_tok_s"]["per_stream"]
+    monkeypatch.setenv("SPARKFIT_EFFICIENCY", "0.35")
+    sf.main(["plan", "-m", "llama3.1-8b", "-q", "q4_k_m", "--json"])
+    low = json.loads(capsys.readouterr().out)["decode_tok_s"]["per_stream"]
+    assert low < base

@@ -261,14 +261,15 @@ def render_verdict(bd: dict, advise_hint: str | None = None) -> None:
 
 
 def render_speed(tp: dict, suffix: str = "", show_assumptions: bool = False,
-                 bandwidth: float | None = None) -> None:
+                 bandwidth: float | None = None,
+                 efficiency: float = BW_EFFICIENCY) -> None:
     """Print the decode-speed roofline block."""
     print(bold("  Decode speed (memory-bandwidth roofline)"))
     print(f"    {tp['per_stream']:6.1f} tok/s per stream{suffix}")
     print(f"    feel: {speed_verdict(tp['per_stream'])}")
     if show_assumptions:
         bw = bandwidth or SPARK["bandwidth_gbps"]
-        print(dim(f"    (assumes ~{int(BW_EFFICIENCY * 100)}% of {bw:.0f} GB/s; "
+        print(dim(f"    (assumes ~{int(efficiency * 100)}% of {bw:.0f} GB/s; "
                   "prefill/compute not modeled)"))
 
 
@@ -310,6 +311,17 @@ def add_model_flags(p: argparse.ArgumentParser) -> None:
     p.add_argument("--head-dim", type=int, default=128, help="custom: head dim")
 
 
+def _envf(name: str, default: "float | None") -> "float | None":
+    """Read a float from an environment variable, falling back to default."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
 def add_workload_flags(p: argparse.ArgumentParser) -> None:
     """Attach the workload/environment flags shared by plan/advise/fit."""
     p.add_argument("-q", "--quant", default="q4_k_m", help="quantization (default q4_k_m)")
@@ -317,12 +329,15 @@ def add_workload_flags(p: argparse.ArgumentParser) -> None:
     p.add_argument("-b", "--batch", type=int, default=1, help="batch size per stream")
     p.add_argument("-n", "--concurrency", type=int, default=1, help="concurrent streams/replicas")
     p.add_argument("--kv-dtype", default="fp16", choices=list(KV_BYTES), help="KV-cache dtype")
-    p.add_argument("--os-reserve", type=float, default=DEFAULT_OS_RESERVE_GB,
+    p.add_argument("--os-reserve", type=float, default=_envf("SPARKFIT_OS_RESERVE", DEFAULT_OS_RESERVE_GB),
                    help="GB reserved for OS + Grace CPU side")
-    p.add_argument("--framework", type=float, default=DEFAULT_FRAMEWORK_GB,
+    p.add_argument("--framework", type=float, default=_envf("SPARKFIT_FRAMEWORK", DEFAULT_FRAMEWORK_GB),
                    help="GB for CUDA context + serving framework")
     p.add_argument("--total-mem", type=float, help="override total unified memory (GB)")
-    p.add_argument("--bandwidth", type=float, help="override memory bandwidth (GB/s)")
+    p.add_argument("--bandwidth", type=float, default=_envf("SPARKFIT_BANDWIDTH", None),
+                   help="override memory bandwidth (GB/s)")
+    p.add_argument("--efficiency", type=float, default=_envf("SPARKFIT_EFFICIENCY", BW_EFFICIENCY),
+                   help="fraction of peak bandwidth reached (calibrate on your device)")
     p.add_argument("--live", action="store_true",
                    help="plan against memory free NOW (read from the device)")
     p.add_argument("--json", action="store_true", help="machine-readable JSON output")
@@ -547,7 +562,7 @@ def cmd_quick(args: argparse.Namespace) -> None:
     for qz in QUANT_LADDER:
         bd = budget(spec, qz, ctx, 1, conc, args.kv_dtype, args.os_reserve,
                     args.framework, args.total_mem)
-        tp = decode_tok_s(spec, qz, ctx, 1, args.kv_dtype, args.bandwidth)
+        tp = decode_tok_s(spec, qz, ctx, 1, args.kv_dtype, args.bandwidth, args.efficiency)
         ladder.append((qz, bd, tp))
         if bd["fits"]:
             if first_fit is None:
@@ -557,7 +572,7 @@ def cmd_quick(args: argparse.Namespace) -> None:
     chosen = args.quant or auto or first_fit or QUANT_LADDER[-1]
     bd = budget(spec, chosen, ctx, 1, conc, args.kv_dtype, args.os_reserve,
                 args.framework, args.total_mem)
-    tp = decode_tok_s(spec, chosen, ctx, 1, args.kv_dtype, args.bandwidth)
+    tp = decode_tok_s(spec, chosen, ctx, 1, args.kv_dtype, args.bandwidth, args.efficiency)
 
     if args.json:
         print(json.dumps({
@@ -619,7 +634,7 @@ def cmd_plan(args: argparse.Namespace) -> None:
     bd = budget(spec, args.quant, args.context, args.batch, args.concurrency,
                 args.kv_dtype, args.os_reserve, args.framework, args.total_mem)
     tp = decode_tok_s(spec, args.quant, args.context, args.batch, args.kv_dtype,
-                      args.bandwidth)
+                      args.bandwidth, args.efficiency)
 
     if args.json:
         print(json.dumps({"model": spec, "quant": args.quant, "context": args.context,
@@ -644,7 +659,8 @@ def cmd_plan(args: argparse.Namespace) -> None:
     render_verdict(bd, advise_hint=hint)
     print()
     suffix = f"   |   {tp['aggregate']:6.1f} tok/s aggregate" if streams > 1 else ""
-    render_speed(tp, suffix=suffix, show_assumptions=True, bandwidth=args.bandwidth)
+    render_speed(tp, suffix=suffix, show_assumptions=True, bandwidth=args.bandwidth,
+                 efficiency=args.efficiency)
     print()
 
 
@@ -660,7 +676,7 @@ def cmd_advise(args: argparse.Namespace) -> None:
     for q in QUANT_LADDER:
         bd = budget(spec, q, args.context, args.batch, args.concurrency,
                     args.kv_dtype, args.os_reserve, args.framework, args.total_mem)
-        tp = decode_tok_s(spec, q, args.context, args.batch, args.kv_dtype, args.bandwidth)
+        tp = decode_tok_s(spec, q, args.context, args.batch, args.kv_dtype, args.bandwidth, args.efficiency)
         margin = bd["free"] / bd["total"]
         results.append((q, bd, tp, margin))
 
@@ -721,7 +737,7 @@ def cmd_fit(args: argparse.Namespace) -> None:
             if not bd["fits"]:
                 break
             tp = decode_tok_s(spec, args.quant, args.context, args.batch * n,
-                              args.kv_dtype, args.bandwidth)
+                              args.kv_dtype, args.bandwidth, args.efficiency)
             rows.append((n, bd, tp))
             n += 1
         max_n = rows[-1][0] if rows else 0
@@ -753,7 +769,7 @@ def cmd_fit(args: argparse.Namespace) -> None:
         spec["name"] = name
         bd = budget(spec, args.quant, args.context, args.batch, args.concurrency,
                     args.kv_dtype, args.os_reserve, args.framework, args.total_mem)
-        tp = decode_tok_s(spec, args.quant, args.context, args.batch, args.kv_dtype, args.bandwidth)
+        tp = decode_tok_s(spec, args.quant, args.context, args.batch, args.kv_dtype, args.bandwidth, args.efficiency)
         fitting.append((name, base["total_b"], bd, tp))
     fitting.sort(key=lambda r: r[1], reverse=True)
 
@@ -891,10 +907,11 @@ def build_parser() -> argparse.ArgumentParser:
     qk.add_argument("-c", "--context", type=int, default=8192)
     qk.add_argument("-n", "--concurrency", type=int, default=1)
     qk.add_argument("--kv-dtype", default="fp16", choices=list(KV_BYTES))
-    qk.add_argument("--os-reserve", type=float, default=DEFAULT_OS_RESERVE_GB)
-    qk.add_argument("--framework", type=float, default=DEFAULT_FRAMEWORK_GB)
+    qk.add_argument("--os-reserve", type=float, default=_envf("SPARKFIT_OS_RESERVE", DEFAULT_OS_RESERVE_GB))
+    qk.add_argument("--framework", type=float, default=_envf("SPARKFIT_FRAMEWORK", DEFAULT_FRAMEWORK_GB))
     qk.add_argument("--total-mem", type=float, default=None)
-    qk.add_argument("--bandwidth", type=float, default=None)
+    qk.add_argument("--bandwidth", type=float, default=_envf("SPARKFIT_BANDWIDTH", None))
+    qk.add_argument("--efficiency", type=float, default=_envf("SPARKFIT_EFFICIENCY", BW_EFFICIENCY))
     qk.add_argument("--live", action="store_true",
                     help="plan against memory free NOW (read from the device)")
     qk.add_argument("--json", action="store_true")
