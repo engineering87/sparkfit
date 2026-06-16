@@ -6,16 +6,17 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-### Added
-- Multi-head Latent Attention (MLA) support for DeepSeek V2/V3/R1: the KV-cache is
-  modeled as a compressed latent (`kv_lora_rank + qk_rope_head_dim`) per layer,
-  fixing a large overestimation of the per-head formula.
-- Parameter estimation for DeepSeek fine-grained MoE (routed and shared experts,
-  `first_k_dense_replace` dense prefix) and MLA attention projections. Validated:
-  DeepSeek-V2-Lite ~15.7B, DeepSeek-V3 ~671B total / ~37B active.
-- Built-in catalog entries `deepseek-v2-lite` and `deepseek-r1`.
+### Fixed
+- `--total-mem` now rejects zero or negative values with a clear error message
+  instead of raising an unhandled exception.
 
-## [0.1.0] - 2026-06-15
+### Changed
+- `fit --concurrency-scan` shows a clearer message when a model does not fit even
+  at a single stream.
+- CI now also runs mypy type-checking and enforces a minimum test coverage; the
+  test suite was expanded with CLI integration tests.
+
+## [0.1.0] - 2026-06-16
 
 ### Added
 - Initial release.
@@ -32,6 +33,13 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `config.json` and estimates parameters).
 - `--live` flag: plan against memory free right now instead of the theoretical
   total.
+- Multi-head Latent Attention (MLA) support for DeepSeek V2/V3/R1: the KV-cache is
+  modeled as a compressed latent (`kv_lora_rank + qk_rope_head_dim`) per layer,
+  avoiding a large overestimation of the per-head formula.
+- Parameter estimation for DeepSeek fine-grained MoE (routed and shared experts,
+  `first_k_dense_replace` dense prefix) and MLA attention projections. Validated:
+  DeepSeek-V2-Lite ~15.7B, DeepSeek-V3 ~671B total / ~37B active.
+- Built-in catalog entries `deepseek-v2-lite` and `deepseek-r1`.
 - Context-aware guidance and "hypothetical" labeling when a configuration does not
   fit.
 - Packaged for pip and pipx with a `sparkfit` console entry point; also usable as

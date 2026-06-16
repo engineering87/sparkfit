@@ -195,3 +195,13 @@ def test_cli_unknown_model_errors():
 def test_cli_no_args_prints_help(capsys):
     sf.main([])
     assert "usage" in capsys.readouterr().out.lower()
+
+
+def test_total_mem_zero_errors():
+    with pytest.raises(SystemExit):
+        sf.budget(sf.MODELS["llama3.1-8b"], "q4_k_m", 4096, 1, total_mem=0)
+
+
+def test_total_mem_negative_errors():
+    with pytest.raises(SystemExit):
+        sf.budget(sf.MODELS["llama3.1-8b"], "q4_k_m", 4096, 1, total_mem=-5)

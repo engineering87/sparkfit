@@ -181,6 +181,8 @@ def budget(spec: dict, quant: str, context: int, batch: int, concurrency: int = 
            total_mem: float | None = None) -> dict:
     """Return the full unified-memory breakdown (all values in bytes)."""
     total = (total_mem if total_mem is not None else SPARK["total_mem_gb"]) * GB
+    if total <= 0:
+        raise SystemExit("--total-mem must be a positive number of GB.")
     streams = batch * concurrency
     w = weight_bytes(spec["total_b"], quant)
     kv = kv_total_bytes(spec, context, streams, kv_dtype)
@@ -730,8 +732,12 @@ def cmd_fit(args: argparse.Namespace) -> None:
         print()
         print(bold(f"  Max concurrency | {spec['name']} | {args.quant} | ctx {args.context}"))
         print()
-        print("  " + green(f"> up to {max_n} concurrent stream(s) fit in "
-                           f"{(args.total_mem or SPARK['total_mem_gb']):.0f} GB"))
+        if max_n == 0:
+            print("  " + red("> does not fit even at 1 stream; reduce -c/-q "
+                              "or pick a smaller model"))
+        else:
+            print("  " + green(f"> up to {max_n} concurrent stream(s) fit in "
+                               f"{(args.total_mem or SPARK['total_mem_gb']):.0f} GB"))
         if rows:
             last = rows[-1]
             print(dim(f"    at {max_n} streams: {fmt_gb(last[1]['used']).strip()} used | "
