@@ -29,7 +29,7 @@ import sys
 import urllib.error
 import urllib.request
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 # ---------------------------------------------------------------------------
 # Constants & hardware profile
@@ -373,6 +373,10 @@ def parse_hf_config(cfg: dict) -> dict:
     Handles dense, Mixture-of-Experts, and Multi-head Latent Attention (MLA,
     DeepSeek V2/V3/R1) architectures.
     """
+    # Multimodal configs (Qwen-VL, Qwen3.5, ...) nest the language-model fields
+    # under "text_config"; flatten them so the rest of the parser sees them.
+    if not cfg.get("hidden_size") and isinstance(cfg.get("text_config"), dict):
+        cfg = {**cfg, **cfg["text_config"]}
     g = cfg.get
     hidden = g("hidden_size") or g("n_embd")
     layers = g("num_hidden_layers") or g("n_layer")
@@ -477,8 +481,27 @@ def fetch_hf_config(repo_id: str, revision: str = "main") -> dict:
     return spec
 
 
+def load_local_config(path: str) -> dict:
+    """Read a local config.json (a file, or a directory containing one) into a spec."""
+    cfg_path = os.path.join(path, "config.json") if os.path.isdir(path) else path
+    try:
+        with open(cfg_path, encoding="utf-8") as fh:
+            cfg = json.load(fh)
+    except FileNotFoundError:
+        raise SystemExit(f"No config.json found at '{path}'.")
+    except (json.JSONDecodeError, OSError) as e:
+        raise SystemExit(f"Could not read config '{cfg_path}': {e}")
+    spec = parse_hf_config(cfg)
+    spec["name"] = os.path.basename(os.path.dirname(os.path.abspath(cfg_path))) or "local"
+    spec["source"] = "local"
+    return spec
+
+
 def resolve_target(target: str) -> dict:
-    """Resolve a quick-mode target: a DB id (fuzzy) or a Hugging Face repo id/URL."""
+    """Resolve a quick-mode target: a local config path, a Hugging Face repo id/URL,
+    or a built-in DB id (fuzzy)."""
+    if os.path.exists(target):
+        return load_local_config(target)
     if "/" in target or target.startswith("http"):
         return fetch_hf_config(target)
     name = resolve_db_name(target)
@@ -489,7 +512,8 @@ def resolve_target(target: str) -> dict:
         return spec
     raise SystemExit(
         f"Unknown model '{target}'. Try `sparkfit models`, a partial name "
-        f"(e.g. 'llama 70'), or a Hugging Face id (e.g. 'Qwen/Qwen2.5-7B').")
+        f"(e.g. 'llama 70'), a local config.json path, or a Hugging Face id "
+        f"(e.g. 'Qwen/Qwen2.5-7B').")
 
 
 # ---------------------------------------------------------------------------

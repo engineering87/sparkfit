@@ -224,3 +224,45 @@ def test_env_efficiency_overrides_default(capsys, monkeypatch):
     sf.main(["plan", "-m", "llama3.1-8b", "-q", "q4_k_m", "--json"])
     low = json.loads(capsys.readouterr().out)["decode_tok_s"]["per_stream"]
     assert low < base
+
+
+# --- local config.json support ---
+
+def test_local_config_file(tmp_path, capsys):
+    import json
+    cfg = {"hidden_size": 4096, "intermediate_size": 11008, "num_hidden_layers": 32,
+           "num_attention_heads": 32, "num_key_value_heads": 8, "vocab_size": 32000,
+           "tie_word_embeddings": False}
+    p = tmp_path / "config.json"
+    p.write_text(json.dumps(cfg))
+    sf.main([str(p), "--json"])
+    out = json.loads(capsys.readouterr().out)
+    assert out["model"]["source"] == "local"
+    assert out["model"]["total_b"] == pytest.approx(5.9, abs=0.5)  # these dims, GQA
+
+
+def test_local_config_directory(tmp_path):
+    import json
+    (tmp_path / "config.json").write_text(json.dumps({
+        "hidden_size": 2048, "intermediate_size": 5632, "num_hidden_layers": 24,
+        "num_attention_heads": 16, "num_key_value_heads": 16, "vocab_size": 32000}))
+    spec = sf.load_local_config(str(tmp_path))
+    assert spec["source"] == "local"
+    assert spec["layers"] == 24
+
+
+def test_local_config_text_config_nesting(tmp_path):
+    import json
+    (tmp_path / "config.json").write_text(json.dumps({
+        "model_type": "qwen3_5",
+        "text_config": {"hidden_size": 5120, "intermediate_size": 17408,
+                        "num_hidden_layers": 64, "num_attention_heads": 24,
+                        "num_key_value_heads": 4, "head_dim": 256,
+                        "vocab_size": 248320, "tie_word_embeddings": False}}))
+    spec = sf.load_local_config(str(tmp_path))
+    assert spec["layers"] == 64 and spec["hidden"] == 5120
+
+
+def test_local_config_dir_without_config_errors(tmp_path):
+    with pytest.raises(SystemExit):
+        sf.load_local_config(str(tmp_path))  # empty dir, no config.json

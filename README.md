@@ -75,6 +75,7 @@ sparkfit llama3.1-70b          # built-in catalog id
 sparkfit "llama 70"            # partial match -> llama3.1-70b
 sparkfit 72b                   # even a fragment works
 sparkfit Qwen/Qwen2.5-7B       # Hugging Face id -> reads params online
+sparkfit /models/my-model/config.json   # a local config.json (file or dir)
 ```
 
 <p align="center">

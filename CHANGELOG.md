@@ -6,7 +6,12 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-06-16
+
 ### Added
+- Local `config.json` support: `sparkfit <path>` reads a model config from any
+  file or directory (handy for models served from local paths such as vLLM), with
+  automatic flattening of multimodal `text_config`.
 - `--efficiency` flag and `SPARKFIT_EFFICIENCY` / `SPARKFIT_BANDWIDTH` /
   `SPARKFIT_OS_RESERVE` / `SPARKFIT_FRAMEWORK` environment overrides, so estimates
   can be calibrated to a measured device.
@@ -50,5 +55,6 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Packaged for pip and pipx with a `sparkfit` console entry point; also usable as
   a single standalone script.
 
-[Unreleased]: https://github.com/engineering87/sparkfit/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/engineering87/sparkfit/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/engineering87/sparkfit/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/engineering87/sparkfit/releases/tag/v0.1.0
