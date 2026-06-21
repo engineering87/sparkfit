@@ -29,7 +29,7 @@ import sys
 import urllib.error
 import urllib.request
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 # ---------------------------------------------------------------------------
 # Constants & hardware profile
@@ -162,12 +162,22 @@ def kv_per_token_bytes(spec: dict, kv_dtype: str = "fp16") -> float:
     """
     if spec.get("kv_style") == "mla":
         return spec["layers"] * spec["mla_dim"] * KV_BYTES[kv_dtype]
-    return 2 * spec["layers"] * spec["kv_heads"] * spec["head_dim"] * KV_BYTES[kv_dtype]
+    kv_layers = spec.get("kv_layers", spec["layers"])
+    return 2 * kv_layers * spec["kv_heads"] * spec["head_dim"] * KV_BYTES[kv_dtype]
+
+
+def effective_context(spec: dict, context: int) -> int:
+    """Context capped at the sliding-window size, if the model uses one."""
+    window = spec.get("sliding_window") or 0
+    return min(context, window) if window else context
 
 
 def kv_total_bytes(spec: dict, context: int, batch: int, kv_dtype: str = "fp16") -> float:
-    """Total KV-cache bytes for `context` tokens across `batch` sequences."""
-    return kv_per_token_bytes(spec, kv_dtype) * context * batch
+    """Total KV-cache bytes for `context` tokens across `batch` sequences.
+
+    Sliding-window attention caps the resident cache at the window size.
+    """
+    return kv_per_token_bytes(spec, kv_dtype) * effective_context(spec, context) * batch
 
 
 def activation_bytes(spec: dict, context: int, batch: int) -> float:
@@ -178,13 +188,13 @@ def activation_bytes(spec: dict, context: int, batch: int) -> float:
 def budget(spec: dict, quant: str, context: int, batch: int, concurrency: int = 1,
            kv_dtype: str = "fp16", os_reserve: float = DEFAULT_OS_RESERVE_GB,
            framework: float = DEFAULT_FRAMEWORK_GB,
-           total_mem: float | None = None) -> dict:
+           total_mem: float | None = None, weights_gb: float | None = None) -> dict:
     """Return the full unified-memory breakdown (all values in bytes)."""
     total = (total_mem if total_mem is not None else SPARK["total_mem_gb"]) * GB
     if total <= 0:
         raise SystemExit("--total-mem must be a positive number of GB.")
     streams = batch * concurrency
-    w = weight_bytes(spec["total_b"], quant)
+    w = weights_gb * GB if (weights_gb and weights_gb > 0) else weight_bytes(spec["total_b"], quant)
     kv = kv_total_bytes(spec, context, streams, kv_dtype)
     act = activation_bytes(spec, context, streams)
     overhead = (os_reserve + framework) * GB
@@ -206,18 +216,21 @@ def budget(spec: dict, quant: str, context: int, batch: int, concurrency: int = 
 
 def decode_tok_s(spec: dict, quant: str, context: int, batch: int = 1,
                  kv_dtype: str = "fp16", bandwidth: float | None = None,
-                 efficiency: float = BW_EFFICIENCY) -> dict:
+                 efficiency: float = BW_EFFICIENCY,
+                 weights_gb: float | None = None) -> dict:
     """Memory-bandwidth roofline for decode (token generation) speed.
 
     Decode is memory-bound: each step streams the (active) weights once plus the
     whole KV-cache. This is exactly why Spark's 273 GB/s caps tok/s.
     """
-    bw = (bandwidth if bandwidth is not None else SPARK["bandwidth_gbps"]) * 1e9 * efficiency
-    w_active = weight_bytes(spec["active_b"], quant)
-    kv_step = kv_per_token_bytes(spec, kv_dtype) * context * batch
-    bytes_per_step = w_active + kv_step
+    band = bandwidth if (bandwidth and bandwidth > 0) else SPARK["bandwidth_gbps"]
+    eff = efficiency if (efficiency and efficiency > 0) else BW_EFFICIENCY
+    bw = band * 1e9 * eff
+    w_active = weights_gb * GB if (weights_gb and weights_gb > 0) else weight_bytes(spec["active_b"], quant)
+    kv_step = kv_per_token_bytes(spec, kv_dtype) * effective_context(spec, context) * batch
+    bytes_per_step = max(w_active + kv_step, 1.0)
     agg = batch * bw / bytes_per_step      # aggregate tokens/s across the batch
-    per = agg / batch                      # tokens/s seen by one stream
+    per = agg / batch if batch else 0.0    # tokens/s seen by one stream
     return {"aggregate": agg, "per_stream": per, "bytes_per_step": bytes_per_step}
 
 
@@ -268,8 +281,9 @@ def render_speed(tp: dict, suffix: str = "", show_assumptions: bool = False,
     print(f"    {tp['per_stream']:6.1f} tok/s per stream{suffix}")
     print(f"    feel: {speed_verdict(tp['per_stream'])}")
     if show_assumptions:
-        bw = bandwidth or SPARK["bandwidth_gbps"]
-        print(dim(f"    (assumes ~{int(efficiency * 100)}% of {bw:.0f} GB/s; "
+        bw = bandwidth if (bandwidth and bandwidth > 0) else SPARK["bandwidth_gbps"]
+        eff = efficiency if (efficiency and efficiency > 0) else BW_EFFICIENCY
+        print(dim(f"    (assumes ~{int(eff * 100)}% of {bw:.0f} GB/s; "
                   "prefill/compute not modeled)"))
 
 
@@ -311,6 +325,17 @@ def add_model_flags(p: argparse.ArgumentParser) -> None:
     p.add_argument("--head-dim", type=int, default=128, help="custom: head dim")
 
 
+def _positive_int(value: str) -> int:
+    """argparse type: an integer that must be >= 1 (context/batch/concurrency)."""
+    try:
+        n = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected an integer, got '{value}'")
+    if n < 1:
+        raise argparse.ArgumentTypeError(f"must be >= 1, got {n}")
+    return n
+
+
 def _envf(name: str, default: "float | None") -> "float | None":
     """Read a float from an environment variable, falling back to default."""
     raw = os.environ.get(name)
@@ -325,9 +350,9 @@ def _envf(name: str, default: "float | None") -> "float | None":
 def add_workload_flags(p: argparse.ArgumentParser) -> None:
     """Attach the workload/environment flags shared by plan/advise/fit."""
     p.add_argument("-q", "--quant", default="q4_k_m", help="quantization (default q4_k_m)")
-    p.add_argument("-c", "--context", type=int, default=4096, help="context length")
-    p.add_argument("-b", "--batch", type=int, default=1, help="batch size per stream")
-    p.add_argument("-n", "--concurrency", type=int, default=1, help="concurrent streams/replicas")
+    p.add_argument("-c", "--context", type=_positive_int, default=4096, help="context length")
+    p.add_argument("-b", "--batch", type=_positive_int, default=1, help="batch size per stream")
+    p.add_argument("-n", "--concurrency", type=_positive_int, default=1, help="concurrent streams/replicas")
     p.add_argument("--kv-dtype", default="fp16", choices=list(KV_BYTES), help="KV-cache dtype")
     p.add_argument("--os-reserve", type=float, default=_envf("SPARKFIT_OS_RESERVE", DEFAULT_OS_RESERVE_GB),
                    help="GB reserved for OS + Grace CPU side")
@@ -386,7 +411,20 @@ def parse_hf_config(cfg: dict) -> dict:
             "config.json lacks core fields "
             "(hidden_size/num_hidden_layers/num_attention_heads).")
     kv_heads = g("num_key_value_heads") or heads
-    head_dim = g("head_dim") or (hidden // heads)
+    head_dim = g("head_dim") or (hidden // heads) or 1
+    # Hybrid attention (Qwen3.5, Jamba, ...): only some layers keep a growing
+    # KV-cache; the rest use fixed-size linear/SSM state. Count the KV-bearing ones.
+    layer_types = g("layer_types")
+    interval = g("full_attention_interval")
+    if isinstance(layer_types, list) and layer_types:
+        kv_layers = sum(1 for t in layer_types if t == "full_attention")
+    elif interval and interval > 1:
+        kv_layers = layers // interval
+    else:
+        kv_layers = layers
+    # Sliding-window attention caps the resident KV-cache (Mistral, Gemma, ...).
+    sw = g("sliding_window")
+    sliding_window = sw if (sw and g("use_sliding_window") is not False) else 0
     vocab = g("vocab_size") or 32000
     inter = g("intermediate_size") or (4 * hidden)
     tie = bool(g("tie_word_embeddings"))
@@ -439,13 +477,24 @@ def parse_hf_config(cfg: dict) -> dict:
         mlp_total = mlp_active = layers * _mlp_params(hidden, inter)
         moe = False
 
+    # Vision tower (multimodal): rough ViT param count, added to the footprint only
+    # (it is loaded in memory but not streamed per text-decode token).
+    vc = cfg.get("vision_config")
+    vision = 0
+    if isinstance(vc, dict):
+        vh = vc.get("hidden_size") or 0
+        vd = vc.get("depth") or vc.get("num_hidden_layers") or 0
+        vi = vc.get("intermediate_size") or (4 * vh)
+        if vh and vd:
+            vision = vd * (4 * vh * vh + 2 * vh * vi)
     embed = vocab * hidden
     lm_head = 0 if tie else vocab * hidden
     attn_sum = layers * attn
-    total = embed + lm_head + attn_sum + mlp_total
+    total = embed + lm_head + attn_sum + mlp_total + vision
     active = embed + lm_head + attn_sum + mlp_active
     spec = {"total_b": total / 1e9, "active_b": active / 1e9, "layers": layers,
-            "hidden": hidden, "kv_heads": kv_heads, "head_dim": head_dim, "moe": moe}
+            "hidden": hidden, "kv_heads": kv_heads, "head_dim": head_dim,
+            "kv_layers": kv_layers, "sliding_window": sliding_window, "moe": moe}
     if kv_style == "mla":
         spec["kv_style"] = "mla"
         spec["mla_dim"] = mla_dim
@@ -481,6 +530,27 @@ def fetch_hf_config(repo_id: str, revision: str = "main") -> dict:
     return spec
 
 
+def _measure_weights_bytes(dirpath: str) -> float:
+    """Real on-disk weight size: safetensors index total_size, else sum of files."""
+    idx = os.path.join(dirpath, "model.safetensors.index.json")
+    if os.path.isfile(idx):
+        try:
+            with open(idx, encoding="utf-8") as fh:
+                meta = json.load(fh).get("metadata", {})
+            if meta.get("total_size"):
+                return float(meta["total_size"])
+        except (json.JSONDecodeError, OSError):
+            pass
+    total = 0.0
+    try:
+        for fn in os.listdir(dirpath):
+            if fn.endswith(".safetensors"):
+                total += os.path.getsize(os.path.join(dirpath, fn))
+    except OSError:
+        return 0.0
+    return total
+
+
 def load_local_config(path: str) -> dict:
     """Read a local config.json (a file, or a directory containing one) into a spec."""
     cfg_path = os.path.join(path, "config.json") if os.path.isdir(path) else path
@@ -494,6 +564,9 @@ def load_local_config(path: str) -> dict:
     spec = parse_hf_config(cfg)
     spec["name"] = os.path.basename(os.path.dirname(os.path.abspath(cfg_path))) or "local"
     spec["source"] = "local"
+    wb = _measure_weights_bytes(os.path.dirname(os.path.abspath(cfg_path)))
+    if wb:
+        spec["weights_gb"] = round(wb / GB, 3)
     return spec
 
 
@@ -577,26 +650,38 @@ def apply_live(args: argparse.Namespace) -> float | None:
 # ---------------------------------------------------------------------------
 
 def cmd_quick(args: argparse.Namespace) -> None:
-    """One-shot smart report: auto-pick a quant, show budget, speed, alternatives."""
+    """One-shot smart report: budget, decode speed, and alternatives when estimating."""
     apply_live(args)
     spec = resolve_target(args.target)
+    weights_gb = args.weights_gb if args.weights_gb is not None else spec.get("weights_gb")
     ctx, conc = args.context, args.concurrency
-    ladder = []
-    auto = first_fit = None
-    for qz in QUANT_LADDER:
-        bd = budget(spec, qz, ctx, 1, conc, args.kv_dtype, args.os_reserve,
+
+    ladder: list = []
+    if weights_gb:
+        # Measured/overridden weights: the model exists at one fixed precision, so
+        # exploring other quantizations is not meaningful. Report the single config.
+        chosen = args.quant or "on-disk"
+        qz0 = args.quant or "fp16"  # quant is unused for the weight term here
+        bd = budget(spec, qz0, ctx, 1, conc, args.kv_dtype, args.os_reserve,
+                    args.framework, args.total_mem, weights_gb=weights_gb)
+        tp = decode_tok_s(spec, qz0, ctx, conc, args.kv_dtype, args.bandwidth,
+                          args.efficiency, weights_gb=weights_gb)
+    else:
+        auto = first_fit = None
+        for qz in QUANT_LADDER:
+            b = budget(spec, qz, ctx, 1, conc, args.kv_dtype, args.os_reserve,
+                       args.framework, args.total_mem)
+            t = decode_tok_s(spec, qz, ctx, conc, args.kv_dtype, args.bandwidth, args.efficiency)
+            ladder.append((qz, b, t))
+            if b["fits"]:
+                if first_fit is None:
+                    first_fit = qz
+                if b["free"] / b["total"] >= SAFE_MARGIN and auto is None:
+                    auto = qz
+        chosen = args.quant or auto or first_fit or QUANT_LADDER[-1]
+        bd = budget(spec, chosen, ctx, 1, conc, args.kv_dtype, args.os_reserve,
                     args.framework, args.total_mem)
-        tp = decode_tok_s(spec, qz, ctx, 1, args.kv_dtype, args.bandwidth, args.efficiency)
-        ladder.append((qz, bd, tp))
-        if bd["fits"]:
-            if first_fit is None:
-                first_fit = qz
-            if bd["free"] / bd["total"] >= SAFE_MARGIN and auto is None:
-                auto = qz
-    chosen = args.quant or auto or first_fit or QUANT_LADDER[-1]
-    bd = budget(spec, chosen, ctx, 1, conc, args.kv_dtype, args.os_reserve,
-                args.framework, args.total_mem)
-    tp = decode_tok_s(spec, chosen, ctx, 1, args.kv_dtype, args.bandwidth, args.efficiency)
+        tp = decode_tok_s(spec, chosen, ctx, conc, args.kv_dtype, args.bandwidth, args.efficiency)
 
     if args.json:
         print(json.dumps({
@@ -604,15 +689,17 @@ def cmd_quick(args: argparse.Namespace) -> None:
             "context": ctx, "concurrency": conc, "fits": bd["fits"],
             "used_gb": round(bd["used"] / GB, 2), "headroom_gb": round(bd["free"] / GB, 2),
             "decode_tok_s": round(tp["per_stream"], 1),
+            "weights_gb": round(weights_gb, 2) if weights_gb else None,
             "alternatives": [{"quant": q, "fits": b["fits"],
                               "used_gb": round(b["used"] / GB, 2),
                               "tok_s": round(t["per_stream"], 1)} for q, b, t in ladder],
         }, indent=2))
         return
 
-    src = "Hugging Face" if spec.get("source") == "huggingface" else "built-in"
+    _src = spec.get("source")
+    src = "Hugging Face" if _src == "huggingface" else "local" if _src == "local" else "built-in"
     moe = f" | MoE ({spec['active_b']:.1f}B active)" if spec.get("moe") else ""
-    pick = "auto" if args.quant is None else "chosen"
+    pick = "measured" if weights_gb else ("auto" if args.quant is None else "chosen")
     streams_suffix = f"  |  {conc} streams" if conc > 1 else ""
     print()
     print(bold(f"  {SPARK['name']}  |  {spec['name']}  |  {chosen} ({pick})  |  ctx {ctx}{streams_suffix}"))
@@ -626,6 +713,11 @@ def cmd_quick(args: argparse.Namespace) -> None:
     note = "" if bd["fits"] else dim("   (hypothetical, does not fit)")
     render_speed(tp, suffix=note)
     print()
+    if weights_gb:
+        print(dim(f"  weights: measured on-disk size ~{weights_gb:.1f} GB "
+                  "(quantization not explored)"))
+        print()
+        return
     print(bold("  Other quantizations"))
     for qz, b2, t2 in ladder:
         mark = green("✓") if b2["fits"] else red("✗")
@@ -656,9 +748,11 @@ def cmd_plan(args: argparse.Namespace) -> None:
     apply_live(args)
     spec = resolve_model(args)
     bd = budget(spec, args.quant, args.context, args.batch, args.concurrency,
-                args.kv_dtype, args.os_reserve, args.framework, args.total_mem)
-    tp = decode_tok_s(spec, args.quant, args.context, args.batch, args.kv_dtype,
-                      args.bandwidth, args.efficiency)
+                args.kv_dtype, args.os_reserve, args.framework, args.total_mem,
+                weights_gb=args.weights_gb)
+    tp = decode_tok_s(spec, args.quant, args.context, args.batch * args.concurrency,
+                      args.kv_dtype, args.bandwidth, args.efficiency,
+                      weights_gb=args.weights_gb)
 
     if args.json:
         print(json.dumps({"model": spec, "quant": args.quant, "context": args.context,
@@ -700,7 +794,8 @@ def cmd_advise(args: argparse.Namespace) -> None:
     for q in QUANT_LADDER:
         bd = budget(spec, q, args.context, args.batch, args.concurrency,
                     args.kv_dtype, args.os_reserve, args.framework, args.total_mem)
-        tp = decode_tok_s(spec, q, args.context, args.batch, args.kv_dtype, args.bandwidth, args.efficiency)
+        tp = decode_tok_s(spec, q, args.context, args.batch * args.concurrency,
+                          args.kv_dtype, args.bandwidth, args.efficiency)
         margin = bd["free"] / bd["total"]
         results.append((q, bd, tp, margin))
 
@@ -793,7 +888,8 @@ def cmd_fit(args: argparse.Namespace) -> None:
         spec["name"] = name
         bd = budget(spec, args.quant, args.context, args.batch, args.concurrency,
                     args.kv_dtype, args.os_reserve, args.framework, args.total_mem)
-        tp = decode_tok_s(spec, args.quant, args.context, args.batch, args.kv_dtype, args.bandwidth, args.efficiency)
+        tp = decode_tok_s(spec, args.quant, args.context, args.batch * args.concurrency,
+                          args.kv_dtype, args.bandwidth, args.efficiency)
         fitting.append((name, base["total_b"], bd, tp))
     fitting.sort(key=lambda r: r[1], reverse=True)
 
@@ -903,6 +999,8 @@ def build_parser() -> argparse.ArgumentParser:
     pl = sub.add_parser("plan", help="full unified-memory budget + decode speed for one config")
     add_model_flags(pl)
     add_workload_flags(pl)
+    pl.add_argument("--weights-gb", type=float, default=None,
+                    help="override weight footprint in GB (e.g. real on-disk size)")
     pl.set_defaults(func=cmd_plan)
 
     ad = sub.add_parser("advise", help="recommend the highest-quality quant that fits with margin")
@@ -928,8 +1026,8 @@ def build_parser() -> argparse.ArgumentParser:
     qk = sub.add_parser("quick", help="one-shot smart report (default when you pass just a model)")
     qk.add_argument("target", help="model id / partial name / Hugging Face repo id")
     qk.add_argument("-q", "--quant", default=None, help="force a quant (default: auto-pick)")
-    qk.add_argument("-c", "--context", type=int, default=8192)
-    qk.add_argument("-n", "--concurrency", type=int, default=1)
+    qk.add_argument("-c", "--context", type=_positive_int, default=8192)
+    qk.add_argument("-n", "--concurrency", type=_positive_int, default=1)
     qk.add_argument("--kv-dtype", default="fp16", choices=list(KV_BYTES))
     qk.add_argument("--os-reserve", type=float, default=_envf("SPARKFIT_OS_RESERVE", DEFAULT_OS_RESERVE_GB))
     qk.add_argument("--framework", type=float, default=_envf("SPARKFIT_FRAMEWORK", DEFAULT_FRAMEWORK_GB))
@@ -938,6 +1036,8 @@ def build_parser() -> argparse.ArgumentParser:
     qk.add_argument("--efficiency", type=float, default=_envf("SPARKFIT_EFFICIENCY", BW_EFFICIENCY))
     qk.add_argument("--live", action="store_true",
                     help="plan against memory free NOW (read from the device)")
+    qk.add_argument("--weights-gb", type=float, default=None,
+                    help="override weight footprint in GB (auto-detected from a local dir)")
     qk.add_argument("--json", action="store_true")
     qk.set_defaults(func=cmd_quick)
 

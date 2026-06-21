@@ -6,6 +6,36 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-06-17
+
+### Added
+- Hybrid-attention KV-cache: for models that mix linear/SSM and full-attention
+  layers (e.g. Qwen3.5), only the `full_attention` layers (via `layer_types` or
+  `full_attention_interval`) count toward the KV-cache, fixing a large
+  long-context overestimate.
+- Real on-disk weight size for local model directories (read from the safetensors
+  index or by summing the files), plus a `--weights-gb` override, for an exact
+  footprint regardless of architecture or mixed precision.
+- Vision-tower parameters are counted in the memory footprint for multimodal
+  models.
+- Sliding-window attention caps the resident KV-cache (Mistral, Gemma, ...).
+
+### Fixed
+- Decode throughput now accounts for concurrency in `plan`, `advise`, `fit` and
+  the quick report: per-stream tok/s falls and aggregate tok/s scales as `-n`
+  grows. Previously only the memory budget reflected concurrent streams, so the
+  reported speed stayed at the single-stream value regardless of `-n`.
+- `--context`, `--batch` and `--concurrency` reject zero or negative values with
+  a clear error instead of producing a nonsensical budget (or, for `--batch 0`,
+  crashing with a division error).
+- Closed a file handle left open when reading the safetensors weight index.
+- Local-config models showed `[built-in]` in the header instead of `[local]`.
+- A non-positive `--weights-gb` no longer crashes; it falls back to the estimate.
+- Non-positive `--efficiency` / `--bandwidth` fall back to defaults instead of
+  producing nonsensical speeds.
+- Removed an unsupported `python_version` from the mypy config that broke recent
+  mypy versions in CI.
+
 ## [0.2.0] - 2026-06-16
 
 ### Added
@@ -55,6 +85,7 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Packaged for pip and pipx with a `sparkfit` console entry point; also usable as
   a single standalone script.
 
-[Unreleased]: https://github.com/engineering87/sparkfit/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/engineering87/sparkfit/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/engineering87/sparkfit/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/engineering87/sparkfit/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/engineering87/sparkfit/releases/tag/v0.1.0

@@ -1,30 +1,44 @@
 ## sparkfit v0.2.0
 
-Broader model coverage, device calibration, and real-hardware validation.
+Second release of **sparkfit**, the LLM memory capacity planner for the NVIDIA
+DGX Spark (GB10). This release broadens model coverage and adds device
+calibration.
 
-### Added
-- Local `config.json` support: `sparkfit <path>` plans any model from a local file
-  or directory, including multimodal configs that nest fields under `text_config`.
-  Ideal for models served from local paths (e.g. vLLM).
-- Multi-head Latent Attention (MLA) for DeepSeek V2/V3/R1: the compressed latent
-  KV-cache is modeled correctly, avoiding a large per-head overestimate. Parameter
-  estimation now also covers DeepSeek fine-grained MoE. Built-in entries
-  `deepseek-v2-lite` and `deepseek-r1`.
-- `--efficiency` flag and `SPARKFIT_*` environment overrides to calibrate the
-  bandwidth roofline and reserves to a measured device.
+### Highlights
+- **Local config.json**: `sparkfit <path>` plans any model from a local file or
+  directory, including multimodal configs nested under `text_config`. Ideal for
+  models served from local paths such as vLLM.
+- **MLA support (DeepSeek V2/V3/R1)**: models the compressed latent KV-cache,
+  avoiding a roughly 50x overestimate, with DeepSeek fine-grained MoE parameter
+  estimation and built-in `deepseek-v2-lite` and `deepseek-r1` entries.
+- **Calibration**: `--efficiency` flag and `SPARKFIT_*` environment overrides to
+  match the bandwidth roofline and reserves to a measured device.
+- **Real-hardware validation**: on a DGX Spark, bandwidth efficiency about 0.85 to
+  0.89, near-linear concurrency to 8 streams, and measurable contention when
+  co-serving models.
+- **Robustness**: `--total-mem` is validated; clearer `fit --concurrency-scan`
+  message when nothing fits.
 
-### Fixed
-- `--total-mem` rejects zero or negative values with a clear message instead of
-  crashing.
+### Commands
+`plan`, `advise`, `fit`, `scan`, `models`, plus a one-shot quick mode (pass a model
+name, a partial name, a Hugging Face id, or a local config path). Every command
+supports `--json`.
 
-### Changed
-- Clearer `fit --concurrency-scan` message when nothing fits.
-- CI adds mypy type-checking and enforced coverage; expanded the test suite.
+### Install
+```bash
+pipx install git+https://github.com/engineering87/sparkfit.git
+sparkfit llama3.1-70b
+```
+Or clone and run the single file: `python src/sparkfit.py llama3.1-70b`.
 
-### Validated on a real DGX Spark
-- Bandwidth efficiency about 0.85 to 0.89 (vs the conservative 0.70 default).
-- Aggregate throughput scales near-linearly to 8 concurrent streams (within ~5%).
-- Co-serving a second model cuts decode speed (shared 273 GB/s); model your share
-  with `--bandwidth` or `--efficiency`.
+### Quality
+Linted with ruff, type-checked with mypy, 32 tests at about 80% coverage, CI on
+Python 3.8 to 3.12.
+
+### Notes
+These are capacity-planning estimates, not measurements; cross-check with
+`sparkfit scan` on the real machine. Auto-fetch needs internet; gated Hugging Face
+models need `HF_TOKEN`. Hybrid linear-attention models (e.g. Qwen3.5) are not yet
+modeled exactly on the KV-cache side.
 
 **Full changelog**: https://github.com/engineering87/sparkfit/compare/v0.1.0...v0.2.0

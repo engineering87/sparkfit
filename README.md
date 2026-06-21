@@ -161,6 +161,13 @@ kv_per_token = layers * (kv_lora_rank + qk_rope_head_dim) * dtype_bytes
 This is much smaller. For DeepSeek-R1 at 8k context it is about 0.6 GB, versus tens
 of GB for a naive per-head estimate.
 
+Hybrid models (Qwen3.5, Jamba, ...) mix linear/SSM layers with periodic full
+attention; only the `full_attention` layers keep a growing cache, so just those
+are counted (read from `layer_types` or `full_attention_interval`).
+
+Sliding-window attention (Mistral, Gemma, ...) caps the resident cache at the
+window size, so very long contexts do not keep growing it.
+
 ### Decode speed (roofline)
 
 Token generation is memory-bound: each step reads the active weights once plus the
@@ -188,6 +195,11 @@ embeddings, attention projections, and the MLP or expert layers (including MLA
 projections and DeepSeek fine-grained MoE). Validated against real configs:
 Qwen2.5-7B gives 7.62B (actual 7.61B), Mixtral-8x7B gives 46.7B total and 12.9B
 active, and DeepSeek-V3 gives about 671B total and 37B active.
+
+When you point at a local model directory, sparkfit reads the real on-disk weight
+size (from the safetensors index or the files) and uses it instead of the
+estimate, which is exact even for hybrid, multimodal, or mixed-precision models.
+You can also set it manually with `--weights-gb`.
 
 ### Calibrating to your device
 

@@ -266,3 +266,210 @@ def test_local_config_text_config_nesting(tmp_path):
 def test_local_config_dir_without_config_errors(tmp_path):
     with pytest.raises(SystemExit):
         sf.load_local_config(str(tmp_path))  # empty dir, no config.json
+
+
+def test_local_config_label_shown(tmp_path, capsys):
+    import json
+    (tmp_path / "config.json").write_text(json.dumps({
+        "hidden_size": 4096, "intermediate_size": 11008, "num_hidden_layers": 32,
+        "num_attention_heads": 32, "num_key_value_heads": 8, "vocab_size": 32000}))
+    sf.main([str(tmp_path)])
+    assert "[local]" in capsys.readouterr().out
+
+
+# --- hybrid attention (Qwen3.5-style): only full_attention layers keep a KV-cache ---
+
+def test_hybrid_kv_layers_from_layer_types():
+    cfg = {"hidden_size": 5120, "intermediate_size": 17408, "num_hidden_layers": 8,
+           "num_attention_heads": 24, "num_key_value_heads": 4, "head_dim": 256,
+           "vocab_size": 248320,
+           "layer_types": ["linear_attention", "linear_attention", "linear_attention",
+                           "full_attention", "linear_attention", "linear_attention",
+                           "linear_attention", "full_attention"]}
+    spec = sf.parse_hf_config(cfg)
+    assert spec["kv_layers"] == 2  # 2 of 8 are full_attention
+    assert sf.kv_per_token_bytes(spec, "fp16") == 2 * 2 * 4 * 256 * 2
+
+
+def test_hybrid_kv_layers_from_interval():
+    cfg = {"hidden_size": 5120, "intermediate_size": 17408, "num_hidden_layers": 64,
+           "num_attention_heads": 24, "num_key_value_heads": 4, "head_dim": 256,
+           "vocab_size": 248320, "full_attention_interval": 4}
+    spec = sf.parse_hf_config(cfg)
+    assert spec["kv_layers"] == 16  # 64 // 4
+
+
+def test_standard_model_counts_all_kv_layers():
+    spec = sf.parse_hf_config({"hidden_size": 4096, "num_hidden_layers": 32,
+        "num_attention_heads": 32, "num_key_value_heads": 8, "vocab_size": 32000,
+        "intermediate_size": 11008})
+    assert spec["kv_layers"] == 32  # no hybrid markers -> every layer keeps KV
+
+
+# --- weights override, measured weights, vision tower, sliding window ---
+
+def test_weights_gb_override():
+    spec = sf.MODELS["llama3.1-8b"]
+    bd = sf.budget(spec, "q4_k_m", 4096, 1, weights_gb=35.9)
+    assert bd["weights"] == pytest.approx(35.9 * sf.GB)
+    assert bd["weights"] > sf.budget(spec, "q4_k_m", 4096, 1)["weights"]
+
+
+def test_local_dir_weights_from_index(tmp_path):
+    import json
+    (tmp_path / "config.json").write_text(json.dumps({
+        "hidden_size": 4096, "num_hidden_layers": 32, "num_attention_heads": 32,
+        "num_key_value_heads": 8, "vocab_size": 32000, "intermediate_size": 11008}))
+    (tmp_path / "model.safetensors.index.json").write_text(json.dumps(
+        {"metadata": {"total_size": 35_900_000_000}}))
+    spec = sf.load_local_config(str(tmp_path))
+    assert spec["weights_gb"] == pytest.approx(35.9, abs=0.1)
+
+
+def test_local_dir_weights_from_files(tmp_path):
+    import json
+    (tmp_path / "config.json").write_text(json.dumps({
+        "hidden_size": 2048, "num_hidden_layers": 24, "num_attention_heads": 16,
+        "num_key_value_heads": 16, "vocab_size": 32000, "intermediate_size": 5632}))
+    (tmp_path / "model-00001-of-00002.safetensors").write_bytes(b"\0" * 1_000_000)
+    (tmp_path / "model-00002-of-00002.safetensors").write_bytes(b"\0" * 2_000_000)
+    spec = sf.load_local_config(str(tmp_path))
+    assert spec["weights_gb"] == pytest.approx(0.003, abs=1e-4)
+
+
+def test_vision_tower_adds_to_total_only():
+    base = {"hidden_size": 4096, "num_hidden_layers": 32, "num_attention_heads": 32,
+            "num_key_value_heads": 8, "vocab_size": 32000, "intermediate_size": 11008}
+    no_v = sf.parse_hf_config(dict(base))
+    with_v = sf.parse_hf_config({**base, "vision_config": {
+        "hidden_size": 1152, "depth": 27, "intermediate_size": 4304}})
+    assert with_v["total_b"] > no_v["total_b"]
+    assert with_v["active_b"] == no_v["active_b"]  # vision not streamed at decode
+
+
+def test_sliding_window_caps_kv():
+    spec = sf.parse_hf_config({
+        "hidden_size": 4096, "num_hidden_layers": 32, "num_attention_heads": 32,
+        "num_key_value_heads": 8, "vocab_size": 32000, "intermediate_size": 14336,
+        "sliding_window": 4096})
+    assert spec["sliding_window"] == 4096
+    assert sf.kv_total_bytes(spec, 32768, 1) == sf.kv_total_bytes(spec, 4096, 1)
+
+
+def test_sliding_window_disabled_by_flag():
+    spec = sf.parse_hf_config({
+        "hidden_size": 4096, "num_hidden_layers": 32, "num_attention_heads": 32,
+        "num_key_value_heads": 8, "vocab_size": 32000, "intermediate_size": 14336,
+        "sliding_window": 4096, "use_sliding_window": False})
+    assert spec["sliding_window"] == 0
+    assert sf.kv_total_bytes(spec, 32768, 1) > sf.kv_total_bytes(spec, 4096, 1)
+
+
+def test_weights_gb_nonpositive_falls_back():
+    spec = sf.MODELS["llama3.1-8b"]
+    base = sf.budget(spec, "fp16", 4096, 1)["weights"]
+    assert sf.budget(spec, "fp16", 4096, 1, weights_gb=0)["weights"] == base
+    assert sf.budget(spec, "fp16", 4096, 1, weights_gb=-5)["weights"] == base
+    assert sf.decode_tok_s(spec, "fp16", 4096, 1, weights_gb=0)["per_stream"] > 0
+
+
+# --- weights-override quick mode is single-config and consistent ---
+
+def test_quick_weights_override_single_config(tmp_path, capsys):
+    import json
+    (tmp_path / "config.json").write_text(json.dumps({
+        "hidden_size": 4096, "num_hidden_layers": 32, "num_attention_heads": 32,
+        "num_key_value_heads": 8, "vocab_size": 32000, "intermediate_size": 11008}))
+    (tmp_path / "model.safetensors.index.json").write_text(json.dumps(
+        {"metadata": {"total_size": 30_000_000_000}}))
+    sf.main([str(tmp_path)])
+    out = capsys.readouterr().out
+    assert "Other quantizations" not in out          # no quant-shopping
+    assert "measured on-disk size" in out
+    assert "30.0 GB" in out                            # weights line uses measured size
+    sf.main([str(tmp_path), "--json"])
+    d = json.loads(capsys.readouterr().out)
+    assert d["alternatives"] == []                     # consistent: no contradictory table
+    assert d["weights_gb"] == pytest.approx(30.0, abs=0.1)
+
+
+def test_quick_weights_gb_flag_single_config(capsys):
+    import json
+    sf.main(["llama3.1-8b", "--weights-gb", "20", "--json"])
+    d = json.loads(capsys.readouterr().out)
+    assert d["weights_gb"] == pytest.approx(20.0)
+    assert d["alternatives"] == []
+    assert d["used_gb"] > 20  # 20 GB weights + reserves
+
+
+def test_quick_normal_still_shows_alternatives(capsys):
+    sf.main(["llama3.1-8b"])
+    assert "Other quantizations" in capsys.readouterr().out
+
+
+def test_nonpositive_efficiency_bandwidth_fall_back():
+    spec = sf.MODELS["llama3.1-8b"]
+    base = sf.decode_tok_s(spec, "q4_k_m", 4096, 1)["per_stream"]
+    assert sf.decode_tok_s(spec, "q4_k_m", 4096, 1, efficiency=-1)["per_stream"] == pytest.approx(base)
+    assert sf.decode_tok_s(spec, "q4_k_m", 4096, 1, efficiency=0)["per_stream"] == pytest.approx(base)
+    assert sf.decode_tok_s(spec, "q4_k_m", 4096, 1, bandwidth=0)["per_stream"] == pytest.approx(base)
+
+
+# --- v0.3.0 review regressions: concurrency in decode + input validation ---
+
+def test_per_stream_decreases_with_concurrency(capsys):
+    import json
+    def per(n):
+        sf.main(["plan", "-m", "llama3.1-8b", "-q", "q4_k_m", "-c", "4096",
+                 "-n", str(n), "--json"])
+        return json.loads(capsys.readouterr().out)["decode_tok_s"]["per_stream"]
+    p1, p4, p8 = per(1), per(4), per(8)
+    # more concurrent streams contend for bandwidth -> each stream is slower
+    assert p1 > p4 > p8
+
+
+def test_aggregate_exceeds_per_stream_under_concurrency(capsys):
+    import json
+    sf.main(["plan", "-m", "llama3.1-8b", "-q", "q4_k_m", "-c", "4096",
+             "-n", "8", "--json"])
+    t = json.loads(capsys.readouterr().out)["decode_tok_s"]
+    assert t["aggregate"] > t["per_stream"] * 5  # ~8x minus weight amortization
+
+
+def test_quick_tok_s_reflects_concurrency(capsys):
+    import json
+    sf.main(["llama3.1-8b", "-n", "1", "--json"])
+    one = json.loads(capsys.readouterr().out)["decode_tok_s"]
+    sf.main(["llama3.1-8b", "-n", "8", "--json"])
+    eight = json.loads(capsys.readouterr().out)["decode_tok_s"]
+    assert eight < one
+
+
+def test_concurrency_one_matches_single_stream(capsys):
+    import json
+    # the default single-stream number must not change (validated on real HW)
+    sf.main(["plan", "-m", "llama3.1-8b", "-q", "q4_k_m", "-c", "4096", "-n", "1", "--json"])
+    a = json.loads(capsys.readouterr().out)["decode_tok_s"]["per_stream"]
+    sf.main(["plan", "-m", "llama3.1-8b", "-q", "q4_k_m", "-c", "4096", "--json"])
+    b = json.loads(capsys.readouterr().out)["decode_tok_s"]["per_stream"]
+    assert a == pytest.approx(b)
+
+
+def test_decode_tok_s_zero_batch_no_crash():
+    spec = sf.MODELS["llama3.1-8b"]
+    t = sf.decode_tok_s(spec, "q4_k_m", 4096, 0)  # defensive guard, no ZeroDivision
+    assert t["per_stream"] == 0.0
+
+
+@pytest.mark.parametrize("flag,val", [("-c", "0"), ("-c", "-5"), ("-b", "0"), ("-n", "0")])
+def test_nonpositive_workload_dims_rejected(flag, val):
+    with pytest.raises(SystemExit):
+        sf.main(["plan", "-m", "llama3.1-8b", flag, val])
+
+
+def test_positive_int_type():
+    import argparse
+    assert sf._positive_int("3") == 3
+    for bad in ("0", "-1", "x"):
+        with pytest.raises(argparse.ArgumentTypeError):
+            sf._positive_int(bad)
