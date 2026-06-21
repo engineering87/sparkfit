@@ -171,14 +171,19 @@ window size, so very long contexts do not keep growing it.
 ### Decode speed (roofline)
 
 Token generation is memory-bound: each step reads the active weights once plus the
-resident KV-cache. With a fraction `eff` of peak bandwidth actually reached:
+resident KV-cache of every concurrent stream. With a fraction `eff` of peak
+bandwidth actually reached:
 
 ```
-bytes_per_step    = active_weights + kv_per_token * context * batch
-tok_s_per_stream  = bandwidth * eff / bytes_per_step
+streams           = batch * concurrency
+bytes_per_step    = active_weights + kv_per_token * context * streams
+tok_s_aggregate   = streams * bandwidth * eff / bytes_per_step
+tok_s_per_stream  = tok_s_aggregate / streams
 ```
 
-Defaults: `bandwidth` 273 GB/s, `eff` 0.70. For MoE only the active parameters are
+Defaults: `bandwidth` 273 GB/s, `eff` 0.70. Weights are read once per step but the
+KV-cache is read for all streams, so adding concurrency raises aggregate
+throughput while each stream gets slower. For MoE only the active parameters are
 read, which is why a large MoE can be far faster than its total size suggests.
 Prefill (compute-bound) time is not modeled; on Spark the practical limit is
 decode.
