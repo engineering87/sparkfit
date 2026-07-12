@@ -7,6 +7,9 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- Packaging: tagged releases are built and published to PyPI automatically via
+  GitHub Actions Trusted Publishing, so sparkfit can be installed with
+  `pip install sparkfit` (or `pipx install sparkfit`).
 - Co-serving planner: `sparkfit serve MODEL[:quant[:context]] ...` plans several
   models on one Spark at once. Their weights, KV-cache and activations sum against
   the unified 128 GB, and the shared 273 GB/s is split across the models decoding

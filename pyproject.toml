@@ -32,6 +32,7 @@ dependencies = []  # standard library only
 Homepage = "https://github.com/engineering87/sparkfit"
 Repository = "https://github.com/engineering87/sparkfit"
 Issues = "https://github.com/engineering87/sparkfit/issues"
+Changelog = "https://github.com/engineering87/sparkfit/blob/main/CHANGELOG.md"
 
 [project.scripts]
 sparkfit = "sparkfit:main"

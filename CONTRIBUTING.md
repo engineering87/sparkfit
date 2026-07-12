@@ -63,4 +63,11 @@ Every notable change is recorded under "Unreleased" in `CHANGELOG.md`. To cut a
 release, move that section under a dated `X.Y.Z` heading, bump the version in
 `pyproject.toml` and `src/sparkfit.py`, and add longer-form notes as
 `docs/releases/vX.Y.Z.md` (follow the structure of the existing files). Publish
-with `gh release create vX.Y.Z --notes-file docs/releases/vX.Y.Z.md`.
+the GitHub release with `gh release create vX.Y.Z --notes-file docs/releases/vX.Y.Z.md`.
+
+Pushing a `vX.Y.Z` tag triggers `.github/workflows/release.yml`, which builds the
+sdist and wheel and publishes them to PyPI via
+[Trusted Publishing](https://docs.pypi.org/trusted-publishers/) (OIDC, no API
+token). This requires a one-time setup on PyPI: register this repository and the
+`release.yml` workflow as a trusted publisher for the `sparkfit` project, under a
+release environment named `pypi`.

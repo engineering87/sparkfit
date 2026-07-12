@@ -38,6 +38,12 @@ sparkfit is a CLI, so [pipx](https://pipx.pypa.io/) is the cleanest way to insta
 it (isolated environment, global `sparkfit` command):
 
 ```bash
+pipx install sparkfit        # or: pip install sparkfit
+```
+
+To get the latest unreleased code, install from source instead:
+
+```bash
 pipx install git+https://github.com/engineering87/sparkfit.git
 ```
 
