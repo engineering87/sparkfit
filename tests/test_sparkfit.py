@@ -473,3 +473,194 @@ def test_positive_int_type():
     for bad in ("0", "-1", "x"):
         with pytest.raises(argparse.ArgumentTypeError):
             sf._positive_int(bad)
+
+
+# --- v0.4.0: quantization auto-detect from config.json ---
+
+@pytest.mark.parametrize("qc,expected", [
+    ({"quant_method": "fp8"}, "fp8"),
+    ({"quant_method": "gptq", "bits": 4}, "q4_0"),
+    ({"quant_method": "awq", "w_bit": 4}, "q4_0"),
+    ({"load_in_4bit": True}, "q4_0"),
+    ({"load_in_8bit": True}, "int8"),
+    ({"quant_method": "gptq", "bits": 8}, "int8"),
+    ({"quant_method": "gptq", "bits": 3}, "q3_k_m"),
+    ({"config_groups": {"g0": {"weights": {"num_bits": 8, "type": "float"}}}}, "fp8"),
+    (None, None),
+])
+def test_detect_quant(qc, expected):
+    cfg = {"hidden_size": 4096, "num_hidden_layers": 32, "num_attention_heads": 32}
+    if qc is not None:
+        cfg["quantization_config"] = qc
+    assert sf._detect_quant(cfg) == expected
+
+
+def test_parse_hf_config_sets_detected_quant():
+    cfg = {"hidden_size": 4096, "num_hidden_layers": 32, "num_attention_heads": 32,
+           "num_key_value_heads": 8, "quantization_config": {"quant_method": "fp8"}}
+    assert sf.parse_hf_config(cfg)["detected_quant"] == "fp8"
+
+
+def test_quick_uses_detected_quant(tmp_path, capsys):
+    import json
+    (tmp_path / "config.json").write_text(json.dumps({
+        "hidden_size": 4096, "intermediate_size": 11008, "num_hidden_layers": 32,
+        "num_attention_heads": 32, "num_key_value_heads": 8, "vocab_size": 32000,
+        "tie_word_embeddings": False, "quantization_config": {"quant_method": "fp8"}}))
+    sf.main([str(tmp_path), "--json"])
+    out = json.loads(capsys.readouterr().out)
+    assert out["detected_quant"] == "fp8"
+    assert out["chosen_quant"] == "fp8"  # detected quant is the default pick
+
+
+def test_quick_explicit_quant_overrides_detected(tmp_path, capsys):
+    import json
+    (tmp_path / "config.json").write_text(json.dumps({
+        "hidden_size": 4096, "intermediate_size": 11008, "num_hidden_layers": 32,
+        "num_attention_heads": 32, "num_key_value_heads": 8, "vocab_size": 32000,
+        "tie_word_embeddings": False, "quantization_config": {"quant_method": "fp8"}}))
+    sf.main([str(tmp_path), "-q", "q4_k_m", "--json"])
+    out = json.loads(capsys.readouterr().out)
+    assert out["chosen_quant"] == "q4_k_m"  # explicit -q wins
+
+
+def test_no_quant_config_leaves_detection_none(tmp_path, capsys):
+    import json
+    (tmp_path / "config.json").write_text(json.dumps({
+        "hidden_size": 4096, "intermediate_size": 11008, "num_hidden_layers": 32,
+        "num_attention_heads": 32, "num_key_value_heads": 8, "vocab_size": 32000}))
+    sf.main([str(tmp_path), "--json"])
+    out = json.loads(capsys.readouterr().out)
+    assert out["detected_quant"] is None  # unchanged behaviour when absent
+
+
+# --- v0.4.0: prefill / time-to-first-token roofline ---
+
+def test_compute_mult_mapping():
+    assert sf._compute_mult("fp8") == 2.0
+    assert sf._compute_mult("nvfp4") == 4.0
+    assert sf._compute_mult("q4_k_m") == 1.0  # GGUF dequantizes to fp16 for compute
+
+
+def test_prefill_bound_flips_with_prompt_length():
+    spec = dict(sf.MODELS["llama3.1-70b"])
+    short = sf.prefill_stats(spec, "fp8", 128)
+    long = sf.prefill_stats(spec, "fp8", 32768)
+    assert short["bound"] == "bandwidth"   # tiny prompt: just stream weights once
+    assert long["bound"] == "compute"      # long prompt: compute dominates
+    assert long["ttft_s"] > short["ttft_s"]
+
+
+def test_prefill_ttft_increases_with_prompt():
+    spec = dict(sf.MODELS["llama3.1-8b"])
+    t = [sf.prefill_stats(spec, "fp8", n)["ttft_s"] for n in (512, 4096, 16384)]
+    assert t[0] < t[1] < t[2]
+
+
+def test_prefill_mfu_scales_compute_time():
+    spec = dict(sf.MODELS["llama3.1-70b"])
+    slow = sf.prefill_stats(spec, "fp8", 32768, mfu=0.15)["ttft_s"]
+    fast = sf.prefill_stats(spec, "fp8", 32768, mfu=0.30)["ttft_s"]
+    assert fast == pytest.approx(slow / 2, rel=0.02)  # compute-bound: 2x MFU -> half time
+
+
+def test_prefill_nonpositive_params_fall_back():
+    spec = dict(sf.MODELS["llama3.1-8b"])
+    base = sf.prefill_stats(spec, "fp8", 8192)["ttft_s"]
+    assert sf.prefill_stats(spec, "fp8", 8192, mfu=-1, tflops=0)["ttft_s"] == pytest.approx(base)
+
+
+def test_cli_plan_prefill_json(capsys):
+    import json
+    sf.main(["plan", "-m", "llama3.1-8b", "-q", "fp8", "--prompt-tokens", "2048", "--json"])
+    pf = json.loads(capsys.readouterr().out)["prefill"]
+    assert pf["prompt_tokens"] == 2048 and pf["ttft_s"] > 0 and pf["bound"] in ("compute", "bandwidth")
+
+
+def test_cli_quick_prefill_json(capsys):
+    import json
+    sf.main(["llama3.1-8b", "--json"])
+    d = json.loads(capsys.readouterr().out)
+    assert d["prefill_ttft_s"] > 0 and d["prefill_bound"] in ("compute", "bandwidth")
+
+
+def test_cli_plan_prefill_text(capsys):
+    sf.main(["plan", "-m", "llama3.1-8b", "-q", "fp8"])
+    assert "time-to-first-token" in capsys.readouterr().out
+
+
+# --- v0.4.0: co-serving / contention (serve) ---
+
+def _serve_json(capsys, argv):
+    import json
+    sf.main(argv)
+    return json.loads(capsys.readouterr().out)
+
+
+def test_serve_single_model_no_contention(capsys):
+    d = _serve_json(capsys, ["serve", "llama3.1-8b:fp8:4096", "--json"])
+    m = d["models"][0]
+    assert d["active_models"] == 1
+    assert m["tok_s_contended"] == m["tok_s_alone"]
+
+
+def test_serve_two_models_split_bandwidth(capsys):
+    d = _serve_json(capsys, ["serve", "qwen2.5-7b:fp8:4096", "gemma2-9b:fp8:4096", "--json"])
+    for m in d["models"]:
+        assert m["tok_s_contended"] == pytest.approx(m["tok_s_alone"] / 2, rel=0.02)
+
+
+def test_serve_memory_sums_with_overhead(capsys):
+    d = _serve_json(capsys, ["serve", "qwen2.5-7b:fp8:4096", "llama3.2-3b:fp8:2048", "--json"])
+    parts = sum(m["total_gb"] for m in d["models"]) + d["memory_gb"]["overhead"]
+    assert round(parts, 2) == d["memory_gb"]["used"]
+
+
+def test_serve_fits_and_overflow(capsys):
+    ok = _serve_json(capsys, ["serve", "llama3.2-3b:fp8:2048", "--json"])
+    assert ok["fits"] is True
+    big = _serve_json(capsys, ["serve", "deepseek-r1:fp8:8192", "--json"])
+    assert big["fits"] is False  # 671B does not fit on 128 GB
+
+
+def test_serve_per_token_quant_and_context(capsys):
+    d = _serve_json(capsys, ["serve", "llama3.1-8b:q4_k_m:16384", "--json"])
+    m = d["models"][0]
+    assert m["quant"] == "q4_k_m" and m["context"] == 16384
+
+
+def test_serve_defaults_from_global_flags(capsys):
+    # token without :quant:ctx inherits -q / -c
+    d = _serve_json(capsys, ["serve", "llama3.1-8b", "-q", "fp8", "-c", "2048", "--json"])
+    m = d["models"][0]
+    assert m["quant"] == "fp8" and m["context"] == 2048
+
+
+def test_serve_bad_context_rejected():
+    with pytest.raises(SystemExit):
+        sf.main(["serve", "llama3.1-8b:fp8:notanumber"])
+    with pytest.raises(SystemExit):
+        sf.main(["serve", "llama3.1-8b:fp8:-5"])
+
+
+def test_cli_serve_text(capsys):
+    sf.main(["serve", "qwen2.5-7b:fp8:4096", "gemma2-9b:fp8:4096"])
+    out = capsys.readouterr().out
+    assert "Co-serving" in out and "shared" in out
+
+
+# --- v0.4.0 review fixes ---
+
+def test_quick_prompt_tokens_flag_takes_effect(capsys):
+    import json
+    sf.main(["llama3.1-70b", "-q", "fp8", "--prompt-tokens", "128", "--json"])
+    short = json.loads(capsys.readouterr().out)["prefill_ttft_s"]
+    sf.main(["llama3.1-70b", "-q", "fp8", "--prompt-tokens", "32768", "--json"])
+    long = json.loads(capsys.readouterr().out)["prefill_ttft_s"]
+    assert long > short  # the flag must change the estimate
+
+
+def test_detect_quant_non_numeric_bits_is_safe():
+    cfg = {"hidden_size": 4096, "num_hidden_layers": 32, "num_attention_heads": 32,
+           "quantization_config": {"quant_method": "gptq", "bits": "four"}}
+    assert sf._detect_quant(cfg) in (None, "q4_0")  # no crash; gptq falls back to q4_0

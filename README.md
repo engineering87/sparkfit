@@ -84,6 +84,22 @@ sparkfit /models/my-model/config.json   # a local config.json (file or dir)
 
 Override any default: `sparkfit qwen2.5-72b -c 16384 -n 4 -q q5_k_m`.
 
+### Co-serving several models
+
+On a unified-memory box you often run more than one model at once (say a
+generator plus an embedding and a reranker). `serve` sums their footprints
+against the 128 GB and splits the shared 273 GB/s across the models decoding at
+the same time, so you see both what co-resides and how much each slows the
+others down:
+
+```bash
+sparkfit serve qwen2.5-7b:fp8:8192 gemma2-9b:fp8:4096 llama3.2-3b:fp8:2048
+```
+
+Each token is `NAME[:quant[:context]]`; quant and context fall back to `-q` and
+`-c`. As a worst case, N models decoding at once each get about their solo speed
+divided by N; idle or bursty models free their share.
+
 ### `--live`: plan against the memory free right now
 
 Run on the Spark, `--live` budgets against currently-free memory (read from
@@ -105,6 +121,7 @@ sparkfit qwen2.5-32b --live
 | `plan`   | Full unified-memory budget plus a decode-speed roofline for one configuration |
 | `advise` | Recommends the highest-quality quant that fits with a 10% margin |
 | `fit`    | Scans the model DB for what fits; `--concurrency-scan` finds max parallel streams |
+| `serve`  | Plans several models co-served at once: shared memory and shared bandwidth |
 | `scan`   | Reads live memory when run on the Spark |
 | `models` | Lists the built-in model database |
 
@@ -185,8 +202,21 @@ Defaults: `bandwidth` 273 GB/s, `eff` 0.70. Weights are read once per step but t
 KV-cache is read for all streams, so adding concurrency raises aggregate
 throughput while each stream gets slower. For MoE only the active parameters are
 read, which is why a large MoE can be far faster than its total size suggests.
-Prefill (compute-bound) time is not modeled; on Spark the practical limit is
-decode.
+
+Prefill (processing the prompt) is instead compute-bound for long prompts and
+bandwidth-bound (stream the weights once) for short ones, so the time to first
+token is modeled as `max(compute_time, memory_time)`:
+
+```
+compute_time = (2 * active_params * prompt + 2 * layers * prompt^2 * hidden)
+               / (peak_tflops * precision_mult * mfu)
+memory_time  = weights_bytes / (bandwidth * eff)
+ttft         = max(compute_time, memory_time)
+```
+
+`precision_mult` is 2 for fp8 and 4 for fp4 (native low-precision matmul), 1
+otherwise; `mfu` (default 0.30) and `peak_tflops` are calibratable with `--mfu`
+and `--compute-tflops`. Set `--prompt-tokens` to size the prompt.
 
 ### Reserves and parameter estimation
 

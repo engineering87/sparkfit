@@ -6,6 +6,23 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- Co-serving planner: `sparkfit serve MODEL[:quant[:context]] ...` plans several
+  models on one Spark at once. Their weights, KV-cache and activations sum against
+  the unified 128 GB, and the shared 273 GB/s is split across the models decoding
+  at the same time (worst case: each gets about its solo speed divided by the
+  number active), so you can see both what co-resides and how much each slows down.
+- Prefill / time-to-first-token roofline: `plan` and the quick report now estimate
+  TTFT as `max(compute-bound, bandwidth-bound)`, so short prompts are limited by
+  streaming the weights once and long prompts by compute. New `--prompt-tokens`
+  (defaults to the context length), plus `--mfu` and `--compute-tflops` (with
+  `SPARKFIT_MFU` / `SPARKFIT_TFLOPS`) to calibrate the compute side to a device.
+- Quantization auto-detect: when a model's `config.json` carries a
+  `quantization_config` (FP8, GPTQ, AWQ, bitsandbytes, compressed-tensors), the
+  quick report uses the detected precision as the default quant instead of
+  guessing, and labels it `(detected)`. Explicit `-q` still overrides it, and
+  models without the field are unaffected.
+
 ## [0.3.0] - 2026-06-17
 
 ### Added

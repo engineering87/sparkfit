@@ -43,12 +43,14 @@ SPARK: dict = {
     "total_mem_gb": 128.0,      # advertised unified LPDDR5x
     "bandwidth_gbps": 273.0,    # 273 GB/s shared CPU+GPU, the real bottleneck
     "fp4_tops": 1000.0,         # ~1 PFLOP FP4 (sparse)
+    "fp16_tflops": 125.0,       # approx dense BF16/FP16 compute (FP4 peak / 4)
 }
 
 # Default chunks of memory you cannot use for a model on a unified system.
 DEFAULT_OS_RESERVE_GB = 8.0     # DGX OS + Grace CPU side working set
 DEFAULT_FRAMEWORK_GB = 2.0      # CUDA context + serving framework overhead
 BW_EFFICIENCY = 0.70            # fraction of peak bandwidth actually reached
+DEFAULT_MFU = 0.30             # model-FLOPs utilization for the prefill roofline
 
 # Thresholds (named so they are not magic numbers scattered through the code).
 BAR_WARN_FRAC = 0.75            # utilization at/above which a bar turns yellow
@@ -154,6 +156,18 @@ def weight_bytes(params_b: float, quant: str) -> float:
     return params_b * 1e9 * quant_bits(quant) / 8.0
 
 
+def _compute_mult(quant: str) -> float:
+    """Relative matmul throughput of a weight precision on Blackwell tensor cores.
+    Only formats with native low-precision matmul (fp8, fp4) run faster; GGUF-style
+    quants dequantize to fp16 for compute, so they get no prefill speedup."""
+    q = quant.lower()
+    if q in ("fp8", "int8"):
+        return 2.0
+    if q in ("nvfp4", "fp4", "mxfp4"):
+        return 4.0
+    return 1.0
+
+
 def kv_per_token_bytes(spec: dict, kv_dtype: str = "fp16") -> float:
     """Bytes of KV-cache consumed per generated token, per sequence.
 
@@ -234,6 +248,34 @@ def decode_tok_s(spec: dict, quant: str, context: int, batch: int = 1,
     return {"aggregate": agg, "per_stream": per, "bytes_per_step": bytes_per_step}
 
 
+def prefill_stats(spec: dict, quant: str, prompt_tokens: int,
+                  bandwidth: float | None = None, efficiency: float = BW_EFFICIENCY,
+                  tflops: float | None = None, mfu: float = DEFAULT_MFU,
+                  weights_gb: float | None = None) -> dict:
+    """Prefill / time-to-first-token roofline: max(compute-bound, bandwidth-bound).
+
+    Prefill processes the whole prompt in one shot, so it is compute-bound for long
+    prompts and bandwidth-bound (stream the weights once) for short ones. FLOPs use
+    the active parameters plus the quadratic attention term; the memory floor is a
+    single read of the resident weights.
+    """
+    band = bandwidth if (bandwidth and bandwidth > 0) else SPARK["bandwidth_gbps"]
+    eff = efficiency if (efficiency and efficiency > 0) else BW_EFFICIENCY
+    tf = tflops if (tflops and tflops > 0) else SPARK["fp16_tflops"]
+    mf = mfu if (mfu and mfu > 0) else DEFAULT_MFU
+    t = max(int(prompt_tokens), 1)
+    peak = tf * 1e12 * _compute_mult(quant) * mf
+    flops = 2 * spec["active_b"] * 1e9 * t + 2 * spec["layers"] * t * t * spec["hidden"]
+    compute_s = flops / peak
+    mem_bytes = (weights_gb * GB if (weights_gb and weights_gb > 0)
+                 else weight_bytes(spec["total_b"], quant))
+    memory_s = mem_bytes / (band * 1e9 * eff)
+    ttft = max(compute_s, memory_s)
+    return {"ttft_s": ttft, "compute_s": compute_s, "memory_s": memory_s,
+            "bound": "compute" if compute_s >= memory_s else "bandwidth",
+            "prompt_tokens": t}
+
+
 def fmt_gb(b: float) -> str:
     """Format a byte count as a right-aligned 'NNN.N GB' string."""
     return f"{b / GB:6.1f} GB"
@@ -283,8 +325,15 @@ def render_speed(tp: dict, suffix: str = "", show_assumptions: bool = False,
     if show_assumptions:
         bw = bandwidth if (bandwidth and bandwidth > 0) else SPARK["bandwidth_gbps"]
         eff = efficiency if (efficiency and efficiency > 0) else BW_EFFICIENCY
-        print(dim(f"    (assumes ~{int(eff * 100)}% of {bw:.0f} GB/s; "
-                  "prefill/compute not modeled)"))
+        print(dim(f"    (assumes ~{int(eff * 100)}% of {bw:.0f} GB/s decode "
+                  "bandwidth)"))
+
+
+def render_prefill(pf: dict) -> None:
+    """Print the prefill / time-to-first-token line."""
+    print(bold("  Prefill / time-to-first-token"))
+    print(f"    ~{pf['ttft_s']:.2f} s to first token for a "
+          f"{pf['prompt_tokens']} token prompt " + dim(f"({pf['bound']} bound)"))
 
 
 # ---------------------------------------------------------------------------
@@ -363,6 +412,12 @@ def add_workload_flags(p: argparse.ArgumentParser) -> None:
                    help="override memory bandwidth (GB/s)")
     p.add_argument("--efficiency", type=float, default=_envf("SPARKFIT_EFFICIENCY", BW_EFFICIENCY),
                    help="fraction of peak bandwidth reached (calibrate on your device)")
+    p.add_argument("--prompt-tokens", type=_positive_int, default=None,
+                   help="prompt length for the prefill/TTFT estimate (default: context)")
+    p.add_argument("--mfu", type=float, default=_envf("SPARKFIT_MFU", DEFAULT_MFU),
+                   help="model FLOPs utilization for prefill (calibrate on your device)")
+    p.add_argument("--compute-tflops", type=float, default=_envf("SPARKFIT_TFLOPS", None),
+                   help="override dense FP16 compute in TFLOP/s for prefill")
     p.add_argument("--live", action="store_true",
                    help="plan against memory free NOW (read from the device)")
     p.add_argument("--json", action="store_true", help="machine-readable JSON output")
@@ -390,6 +445,42 @@ def resolve_db_name(query: str) -> str | None:
 def _mlp_params(hidden: int, inter: int) -> int:
     """Parameter count of one SwiGLU MLP block (gate + up + down)."""
     return 3 * hidden * inter
+
+
+def _detect_quant(cfg: dict) -> "str | None":
+    """Infer a quantization from a HF `quantization_config`, mapped to a name in
+    QUANT_BITS. Returns None when the config is absent or unrecognized, so the
+    caller keeps its normal behaviour. On-disk 4-bit formats (GPTQ/AWQ/NF4) carry
+    group scales, so they are mapped to a ~4.5 bpw proxy rather than a bare 4.0.
+    """
+    qc = cfg.get("quantization_config")
+    if not isinstance(qc, dict):
+        return None
+    method = str(qc.get("quant_method") or "").lower()
+    if qc.get("load_in_4bit"):
+        return "q4_0"
+    if qc.get("load_in_8bit"):
+        return "int8"
+    if method == "fp8":
+        return "fp8"
+    bits = qc.get("bits") or qc.get("w_bit") or qc.get("wbits")
+    # compressed-tensors nests the width under config_groups[*].weights.num_bits
+    if not bits and isinstance(qc.get("config_groups"), dict):
+        for grp in qc["config_groups"].values():
+            w = grp.get("weights") if isinstance(grp, dict) else None
+            if isinstance(w, dict) and w.get("num_bits"):
+                bits = w["num_bits"]
+                if str(w.get("type") or "").lower() == "float" and str(bits) == "8":
+                    return "fp8"
+                break
+    if bits:
+        try:
+            return {8: "int8", 4: "q4_0", 3: "q3_k_m"}.get(int(bits))
+        except (ValueError, TypeError):
+            return None
+    if method in ("gptq", "awq"):
+        return "q4_0"  # these default to 4-bit weights
+    return None
 
 
 def parse_hf_config(cfg: dict) -> dict:
@@ -498,6 +589,9 @@ def parse_hf_config(cfg: dict) -> dict:
     if kv_style == "mla":
         spec["kv_style"] = "mla"
         spec["mla_dim"] = mla_dim
+    dq = _detect_quant(cfg)
+    if dq:
+        spec["detected_quant"] = dq
     return spec
 
 
@@ -678,17 +772,24 @@ def cmd_quick(args: argparse.Namespace) -> None:
                     first_fit = qz
                 if b["free"] / b["total"] >= SAFE_MARGIN and auto is None:
                     auto = qz
-        chosen = args.quant or auto or first_fit or QUANT_LADDER[-1]
+        chosen = (args.quant or spec.get("detected_quant")
+                  or auto or first_fit or QUANT_LADDER[-1])
         bd = budget(spec, chosen, ctx, 1, conc, args.kv_dtype, args.os_reserve,
                     args.framework, args.total_mem)
         tp = decode_tok_s(spec, chosen, ctx, conc, args.kv_dtype, args.bandwidth, args.efficiency)
 
+    pf = prefill_stats(spec, chosen, args.prompt_tokens or ctx, args.bandwidth,
+                       args.efficiency, args.compute_tflops, args.mfu,
+                       weights_gb=weights_gb)
+
     if args.json:
         print(json.dumps({
             "model": spec, "chosen_quant": chosen, "auto": args.quant is None,
+            "detected_quant": spec.get("detected_quant"),
             "context": ctx, "concurrency": conc, "fits": bd["fits"],
             "used_gb": round(bd["used"] / GB, 2), "headroom_gb": round(bd["free"] / GB, 2),
             "decode_tok_s": round(tp["per_stream"], 1),
+            "prefill_ttft_s": round(pf["ttft_s"], 2), "prefill_bound": pf["bound"],
             "weights_gb": round(weights_gb, 2) if weights_gb else None,
             "alternatives": [{"quant": q, "fits": b["fits"],
                               "used_gb": round(b["used"] / GB, 2),
@@ -699,7 +800,14 @@ def cmd_quick(args: argparse.Namespace) -> None:
     _src = spec.get("source")
     src = "Hugging Face" if _src == "huggingface" else "local" if _src == "local" else "built-in"
     moe = f" | MoE ({spec['active_b']:.1f}B active)" if spec.get("moe") else ""
-    pick = "measured" if weights_gb else ("auto" if args.quant is None else "chosen")
+    if weights_gb:
+        pick = "measured"
+    elif args.quant is not None:
+        pick = "chosen"
+    elif spec.get("detected_quant") and chosen == spec.get("detected_quant"):
+        pick = "detected"
+    else:
+        pick = "auto"
     streams_suffix = f"  |  {conc} streams" if conc > 1 else ""
     print()
     print(bold(f"  {SPARK['name']}  |  {spec['name']}  |  {chosen} ({pick})  |  ctx {ctx}{streams_suffix}"))
@@ -713,11 +821,16 @@ def cmd_quick(args: argparse.Namespace) -> None:
     note = "" if bd["fits"] else dim("   (hypothetical, does not fit)")
     render_speed(tp, suffix=note)
     print()
+    render_prefill(pf)
+    print()
     if weights_gb:
         print(dim(f"  weights: measured on-disk size ~{weights_gb:.1f} GB "
                   "(quantization not explored)"))
         print()
         return
+    if pick == "detected":
+        print(dim(f"  quant: detected from config ({chosen})"))
+        print()
     print(bold("  Other quantizations"))
     for qz, b2, t2 in ladder:
         mark = green("✓") if b2["fits"] else red("✗")
@@ -753,6 +866,9 @@ def cmd_plan(args: argparse.Namespace) -> None:
     tp = decode_tok_s(spec, args.quant, args.context, args.batch * args.concurrency,
                       args.kv_dtype, args.bandwidth, args.efficiency,
                       weights_gb=args.weights_gb)
+    pf = prefill_stats(spec, args.quant, args.prompt_tokens or args.context,
+                       args.bandwidth, args.efficiency, args.compute_tflops, args.mfu,
+                       weights_gb=args.weights_gb)
 
     if args.json:
         print(json.dumps({"model": spec, "quant": args.quant, "context": args.context,
@@ -760,7 +876,10 @@ def cmd_plan(args: argparse.Namespace) -> None:
                           "budget_gb": {k: round(v / GB, 3) for k, v in bd.items()
                                         if k not in ("fits", "util")},
                           "fits": bd["fits"], "util": round(bd["util"], 4),
-                          "decode_tok_s": {k: round(v, 2) for k, v in tp.items()}}, indent=2))
+                          "decode_tok_s": {k: round(v, 2) for k, v in tp.items()},
+                          "prefill": {"ttft_s": round(pf["ttft_s"], 3),
+                                      "bound": pf["bound"],
+                                      "prompt_tokens": pf["prompt_tokens"]}}, indent=2))
         return
 
     streams = args.batch * args.concurrency
@@ -779,6 +898,8 @@ def cmd_plan(args: argparse.Namespace) -> None:
     suffix = f"   |   {tp['aggregate']:6.1f} tok/s aggregate" if streams > 1 else ""
     render_speed(tp, suffix=suffix, show_assumptions=True, bandwidth=args.bandwidth,
                  efficiency=args.efficiency)
+    print()
+    render_prefill(pf)
     print()
 
 
@@ -916,6 +1037,95 @@ def cmd_fit(args: argparse.Namespace) -> None:
     print()
 
 
+def cmd_serve(args: argparse.Namespace) -> None:
+    """Plan several models co-served on one Spark: shared memory and shared bandwidth.
+
+    Unified memory is one pool, so every co-resident model's weights, KV-cache and
+    activations add up against the 128 GB. The 273 GB/s is one pool too: when more
+    than one model decodes at the same time they contend for it. As a worst case,
+    with N models decoding at once each gets about its solo speed divided by N.
+    """
+    apply_live(args)
+    total = (args.total_mem if args.total_mem is not None else SPARK["total_mem_gb"]) * GB
+    if total <= 0:
+        raise SystemExit("--total-mem must be a positive number of GB.")
+    rows = []
+    for token in args.models:
+        if "://" in token:  # a full URL: no quant/context suffix to split off
+            parts = [token]
+        else:
+            parts = token.split(":")
+        name = parts[0]
+        q = parts[1] if len(parts) > 1 and parts[1] else None
+        if len(parts) > 2 and parts[2]:
+            try:
+                ctx = int(parts[2])
+            except ValueError:
+                raise SystemExit(f"Bad context in '{token}': '{parts[2]}' is not an integer.")
+        else:
+            ctx = args.context
+        if ctx < 1:
+            raise SystemExit(f"Context must be >= 1 (in '{token}').")
+        spec = resolve_target(name)
+        quant = q or spec.get("detected_quant") or args.quant
+        wgb = spec.get("weights_gb")
+        w = wgb * GB if wgb else weight_bytes(spec["total_b"], quant)
+        kv = kv_total_bytes(spec, ctx, 1, args.kv_dtype)
+        act = activation_bytes(spec, ctx, 1)
+        alone = decode_tok_s(spec, quant, ctx, 1, args.kv_dtype, args.bandwidth,
+                             args.efficiency, weights_gb=wgb)["per_stream"]
+        rows.append({"name": spec["name"], "quant": quant, "context": ctx,
+                     "weights": w, "kv": kv, "act": act, "total": w + kv + act,
+                     "alone": alone})
+    n = len(rows)
+    for r in rows:
+        r["contended"] = r["alone"] / n  # worst case: N models decoding at once
+    overhead = (args.os_reserve + args.framework) * GB
+    used = sum(r["total"] for r in rows) + overhead
+    fits = used <= total
+    band = args.bandwidth if (args.bandwidth and args.bandwidth > 0) else SPARK["bandwidth_gbps"]
+
+    if args.json:
+        print(json.dumps({
+            "models": [{"name": r["name"], "quant": r["quant"], "context": r["context"],
+                        "weights_gb": round(r["weights"] / GB, 2),
+                        "kv_gb": round(r["kv"] / GB, 2),
+                        "total_gb": round(r["total"] / GB, 2),
+                        "tok_s_alone": round(r["alone"], 1),
+                        "tok_s_contended": round(r["contended"], 1)} for r in rows],
+            "active_models": n,
+            "memory_gb": {"used": round(used / GB, 2), "total": round(total / GB, 2),
+                          "overhead": round(overhead / GB, 2),
+                          "headroom": round((total - used) / GB, 2)},
+            "fits": fits, "util": round(used / total, 4)}, indent=2))
+        return
+
+    print()
+    print(bold(f"  Co-serving on {SPARK['name']}  |  {n} models  |  {total / GB:.0f} GB unified"))
+    print()
+    print(dim(f"  {'model':<20}{'quant':>8}{'ctx':>8}{'weights':>10}{'KV':>8}"
+              f"{'total':>9}{'alone':>8}{'shared':>8}"))
+    print(dim("  " + "─" * 79))
+    for r in rows:
+        print(f"  {r['name'][:20]:<20}{r['quant']:>8}{r['context']:>8}"
+              f"{r['weights'] / GB:8.1f}G{r['kv'] / GB:6.1f}G{r['total'] / GB:7.1f}G"
+              f"{r['alone']:8.0f}{r['contended']:8.0f}")
+    print(dim("  " + "─" * 79))
+    frac = used / total
+    print(f"  {'MEMORY':<20}{'':>24}{used / GB:7.1f}G  {bar(frac)} {frac * 100:.1f}%")
+    print()
+    if fits:
+        print("  " + green("✓ FITS") + f"  | {(total - used) / GB:.1f} GB headroom")
+    else:
+        print("  " + red("✗ DOES NOT FIT") + f"  | over by {(used - total) / GB:.1f} GB")
+    print()
+    print(dim(f"  bandwidth: with {n} models decoding at once the {band:.0f} GB/s is shared, "
+              "so 'shared' is each model's solo speed split across them (worst case)."))
+    print(dim("  Idle or bursty models free their share, so real numbers sit between "
+              "'alone' and 'shared'."))
+    print()
+
+
 # ---------------------------------------------------------------------------
 # Subcommand: scan  (live system snapshot)
 # ---------------------------------------------------------------------------
@@ -1015,6 +1225,13 @@ def build_parser() -> argparse.ArgumentParser:
                     help="instead: find max concurrent streams for --model")
     ft.set_defaults(func=cmd_fit)
 
+    sv = sub.add_parser("serve",
+                        help="plan several models co-served on one Spark (shared memory + bandwidth)")
+    sv.add_argument("models", nargs="+",
+                    help="model specs NAME[:quant[:context]] (e.g. deepseek-r1:fp8:8192)")
+    add_workload_flags(sv)
+    sv.set_defaults(func=cmd_serve)
+
     sc = sub.add_parser("scan", help="read live memory when run ON the Spark")
     sc.add_argument("--json", action="store_true")
     sc.set_defaults(func=cmd_scan)
@@ -1034,6 +1251,9 @@ def build_parser() -> argparse.ArgumentParser:
     qk.add_argument("--total-mem", type=float, default=None)
     qk.add_argument("--bandwidth", type=float, default=_envf("SPARKFIT_BANDWIDTH", None))
     qk.add_argument("--efficiency", type=float, default=_envf("SPARKFIT_EFFICIENCY", BW_EFFICIENCY))
+    qk.add_argument("--prompt-tokens", type=_positive_int, default=None)
+    qk.add_argument("--mfu", type=float, default=_envf("SPARKFIT_MFU", DEFAULT_MFU))
+    qk.add_argument("--compute-tflops", type=float, default=_envf("SPARKFIT_TFLOPS", None))
     qk.add_argument("--live", action="store_true",
                     help="plan against memory free NOW (read from the device)")
     qk.add_argument("--weights-gb", type=float, default=None,
@@ -1047,7 +1267,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> None:
     """Entry point. Routes a bare model argument to the quick subcommand."""
     argv = list(sys.argv[1:] if argv is None else argv)
-    known = {"plan", "advise", "fit", "scan", "models", "quick",
+    known = {"plan", "advise", "fit", "serve", "scan", "models", "quick",
              "-h", "--help", "--version", "-V"}
     if not argv:
         build_parser().print_help()

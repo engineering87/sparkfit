@@ -56,3 +56,11 @@ please update both the README "Methodology" section and the tests.
 - Use [Conventional Commits](https://www.conventionalcommits.org/) where you can
   (`feat:`, `fix:`, `docs:`, and so on).
 - Add an entry under "Unreleased" in `CHANGELOG.md`.
+
+## Releases
+
+Every notable change is recorded under "Unreleased" in `CHANGELOG.md`. To cut a
+release, move that section under a dated `X.Y.Z` heading, bump the version in
+`pyproject.toml` and `src/sparkfit.py`, and add longer-form notes as
+`docs/releases/vX.Y.Z.md` (follow the structure of the existing files). Publish
+with `gh release create vX.Y.Z --notes-file docs/releases/vX.Y.Z.md`.
