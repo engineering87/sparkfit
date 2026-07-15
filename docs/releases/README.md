@@ -4,6 +4,7 @@ Per-release highlights for sparkfit. The authoritative, dated list of every chan
 is in the [CHANGELOG](../../CHANGELOG.md); these files are the longer-form notes
 used for each GitHub release.
 
+- [v0.4.0](v0.4.0.md)
 - [v0.3.0](v0.3.0.md)
 - [v0.2.0](v0.2.0.md)
 - [v0.1.0](v0.1.0.md)
