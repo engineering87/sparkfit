@@ -128,7 +128,9 @@ sparkfit qwen2.5-32b --live
 | `advise` | Recommends the highest-quality quant that fits with a 10% margin |
 | `fit`    | Scans the model DB for what fits; `--concurrency-scan` finds max parallel streams |
 | `serve`  | Plans several models co-served at once: shared memory and shared bandwidth |
-| `scan`   | Reads live memory when run on the Spark |
+| `cluster`| Plans one model across several Spark nodes: combined memory and the inter-node fabric |
+| `doctor` | Calibrates efficiency to your device from a measured tok/s and saves it |
+| `scan`   | Live snapshot when run on the Spark: memory, GPU temperature and thermal throttling |
 | `models` | Lists the built-in model database |
 
 Every command supports `--json` for machine-readable output (CI, dashboards,
@@ -139,7 +141,8 @@ scripting).
 `-q/--quant` (default `q4_k_m` for `plan`, `advise`, `fit`; auto in quick mode),
 `-c/--context`, `-b/--batch`, `-n/--concurrency`,
 `--kv-dtype {fp16,bf16,fp8,int8,q4}`, `--os-reserve` (GB, default 8),
-`--framework` (GB, default 2), `--total-mem`, `--bandwidth`, `--efficiency` (default 0.70), `--live`, `--json`.
+`--framework` (GB, default 2), `--total-mem`, `--bandwidth`, `--efficiency` (default 0.70),
+`--engine {vllm,llama.cpp,ollama}` (per-engine efficiency preset), `--live`, `--json`.
 For models not in the DB: `--params --active --layers --hidden --kv-heads --head-dim`.
 
 ## Methodology
@@ -256,7 +259,16 @@ sparkfit llama3.1-8b
 ```
 
 To calibrate efficiency, run a known model on your serving stack, note the real
-decode tok/s, and divide by what sparkfit predicts at `--efficiency 1.0`.
+decode tok/s, and let `sparkfit doctor` do the arithmetic and save it:
+
+```bash
+sparkfit doctor --measured-tok-s 6.8 --weights-gb 35.9 --save   # -> efficiency ~0.89
+sparkfit doctor --engine vllm --save                            # or start from a preset
+```
+
+`doctor` writes the value to `~/.sparkfitrc` (override with `$SPARKFIT_CONFIG`), which
+every command reads as a default. Precedence is flag > environment variable > config
+file > built-in default, so an explicit `--efficiency` on a single run always wins.
 
 
 A robust, architecture-independent shortcut is

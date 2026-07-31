@@ -6,6 +6,38 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- Refreshed the built-in catalog with current models, with parameters derived from
+  the real Hugging Face configs: `qwen3-8b/14b/32b`, the MoE `qwen3-30b-a3b` and
+  `qwen3-235b-a22b`, `mistral-small-24b`, `phi-4`, and `deepseek-v3`.
+- `--engine vllm|llama.cpp|ollama` on `plan`, `advise`, `fit`, `serve`, `cluster`
+  and the quick report applies a per-engine bandwidth-efficiency preset for the run
+  (an explicit `--efficiency` still wins).
+- `scan` now reports GPU temperature and thermal-throttle status (read from
+  `nvidia-smi`, best effort): a warm/hot verdict, and a warning when a hardware or
+  software thermal slowdown is active, since throttling makes real decode run below
+  sparkfit's estimate.
+- `sparkfit doctor`: calibrate the tool to your device. From a measured single-stream
+  decode tok/s it backs out the real bandwidth efficiency (`eff = tok_s * bytes_per_step
+  / bandwidth`); `--engine vllm|llama.cpp|ollama` seeds a per-engine default; with no
+  arguments it reports the device and the settings in effect. `--save` persists to a
+  config file.
+- Config file: commands now read defaults from `~/.sparkfitrc` (or `$SPARKFIT_CONFIG`),
+  with precedence flag > environment variable > config file > built-in default, so a
+  calibrated efficiency (and the other `SPARKFIT_*` knobs) can stick between runs.
+- Cluster planner: `sparkfit cluster MODEL -N 2 ...` plans one model across several
+  DGX Spark nodes. Weights, KV-cache and activations split evenly across the nodes
+  (so models too big for one box can fit), the 200 Gb/s ConnectX fabric is surfaced
+  as the second bottleneck, and decode throughput scales sub-linearly with node
+  count (calibratable with `--scaling` / `--fabric-gbps`). Pipeline parallelism
+  (default) reports aggregate throughput; tensor parallelism reports single-stream.
+
+### Changed
+- `cluster` now lets `--fabric-gbps` scale the multi-node throughput (a slower
+  inter-node fabric lowers the speedup), instead of being informational only.
+- `doctor` never persists a calibrated efficiency above 1.0, and the config file
+  writer preserves comments and unrecognized keys instead of dropping them.
+
 ## [0.4.0] - 2026-07-15
 
 ### Added
