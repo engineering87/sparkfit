@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sparkfit"
-version = "0.4.0"
+version = "0.5.0"
 description = "LLM memory capacity planner for the NVIDIA DGX Spark (unified-memory & bandwidth aware)."
 readme = "README.md"
 requires-python = ">=3.8"
