@@ -664,3 +664,237 @@ def test_detect_quant_non_numeric_bits_is_safe():
     cfg = {"hidden_size": 4096, "num_hidden_layers": 32, "num_attention_heads": 32,
            "quantization_config": {"quant_method": "gptq", "bits": "four"}}
     assert sf._detect_quant(cfg) in (None, "q4_0")  # no crash; gptq falls back to q4_0
+
+
+# --- v0.5.0: multi-node cluster planning ---
+
+def _cluster_json(capsys, argv):
+    import json
+    sf.main(argv)
+    return json.loads(capsys.readouterr().out)
+
+
+def test_cluster_single_node_equals_baseline(capsys):
+    d = _cluster_json(capsys, ["cluster", "llama3.1-70b", "-N", "1", "-q", "fp8", "--json"])
+    dk = d["decode_tok_s"]
+    assert dk["scaling_mult"] == 1.0
+    assert dk["per_stream"] == dk["single_node"]
+
+
+def test_cluster_aggregate_scales_1_to_2_nodes(capsys):
+    one = _cluster_json(capsys, ["cluster", "gpt-oss-120b", "-N", "1", "-q", "mxfp4", "--json"])
+    two = _cluster_json(capsys, ["cluster", "gpt-oss-120b", "-N", "2", "-q", "mxfp4", "--json"])
+    ratio = two["decode_tok_s"]["aggregate"] / one["decode_tok_s"]["aggregate"]
+    assert ratio == pytest.approx(1.5, rel=0.02)  # matches published ~1.5x on a pair
+
+
+def test_cluster_memory_split_and_combined(capsys):
+    d = _cluster_json(capsys, ["cluster", "deepseek-r1", "-N", "4", "-q", "q4_k_m", "--json"])
+    mg = d["memory_gb"]
+    overhead_total = mg["combined_used"] - mg["model"]
+    assert round(mg["model"] / 4 + overhead_total / 4, 2) == mg["per_node_used"]
+    assert mg["combined_total"] == 4 * mg["per_node_total"]
+
+
+def test_cluster_fit_depends_on_node_count(capsys):
+    assert _cluster_json(capsys, ["cluster", "deepseek-r1", "-N", "2", "-q", "q4_k_m", "--json"])["fits"] is False
+    assert _cluster_json(capsys, ["cluster", "deepseek-r1", "-N", "8", "-q", "q4_k_m", "--json"])["fits"] is True
+
+
+def test_cluster_tp_speeds_single_stream_pp_does_not(capsys):
+    tp = _cluster_json(capsys, ["cluster", "llama3.1-70b", "-N", "2", "--parallelism", "tp", "-q", "fp8", "--json"])["decode_tok_s"]
+    pp = _cluster_json(capsys, ["cluster", "llama3.1-70b", "-N", "2", "--parallelism", "pp", "-q", "fp8", "--json"])["decode_tok_s"]
+    assert tp["per_stream"] > tp["single_node"]
+    assert pp["per_stream"] == pp["single_node"]
+
+
+def test_cluster_nodes_must_be_positive():
+    with pytest.raises(SystemExit):
+        sf.main(["cluster", "llama3.1-8b", "-N", "0"])
+
+
+def test_cli_cluster_text(capsys):
+    sf.main(["cluster", "deepseek-r1", "-N", "4", "-q", "q4_k_m"])
+    out = capsys.readouterr().out
+    assert "Cluster plan" in out and "fabric" in out
+
+
+# --- v0.5.0: doctor + config file ---
+
+def test_doctor_calibrates_efficiency_from_measurement(capsys):
+    import json
+    sf.main(["doctor", "--measured-tok-s", "6.8", "--weights-gb", "35.9", "--json"])
+    d = json.loads(capsys.readouterr().out)
+    assert d["calibrated_efficiency"] == pytest.approx(0.894, abs=0.01)  # ~0.89 on real Spark
+
+
+def test_doctor_calibration_needs_model_or_weights():
+    with pytest.raises(SystemExit):
+        sf.main(["doctor", "--measured-tok-s", "6.8"])
+
+
+def test_doctor_rejects_nonpositive_measurement():
+    with pytest.raises(SystemExit):
+        sf.main(["doctor", "--measured-tok-s", "-1", "--weights-gb", "10"])
+
+
+def test_doctor_engine_preset(capsys):
+    import json
+    sf.main(["doctor", "--engine", "vllm", "--json"])
+    assert json.loads(capsys.readouterr().out)["efficiency"] == 0.85
+
+
+def test_doctor_report_json_has_settings(capsys):
+    import json
+    sf.main(["doctor", "--json"])
+    d = json.loads(capsys.readouterr().out)
+    assert "settings" in d and "efficiency" in d["settings"] and "config_path" in d
+
+
+def test_config_file_roundtrip(tmp_path):
+    p = str(tmp_path / "rc")
+    written = sf.write_config({"efficiency": 0.9, "os_reserve": 10}, path=p)
+    assert written == p
+    cfg = sf.load_config_file(p)
+    assert cfg["SPARKFIT_EFFICIENCY"] == "0.9"
+    assert cfg["SPARKFIT_OS_RESERVE"] == "10"
+
+
+def test_doctor_save_writes_config(tmp_path, capsys, monkeypatch):
+    import json
+    p = str(tmp_path / "rc")
+    monkeypatch.setenv("SPARKFIT_CONFIG", p)
+    sf.main(["doctor", "--measured-tok-s", "6.8", "--weights-gb", "35.9", "--save", "--json"])
+    d = json.loads(capsys.readouterr().out)
+    assert d["saved_to"] == p
+    assert sf.load_config_file(p)["SPARKFIT_EFFICIENCY"]  # value persisted
+
+
+def test_load_config_ignores_unknown_and_comments(tmp_path):
+    p = tmp_path / "rc"
+    p.write_text("# comment\nefficiency = 0.8\nbogus = 5\n\n")
+    cfg = sf.load_config_file(str(p))
+    assert cfg == {"SPARKFIT_EFFICIENCY": "0.8"}
+
+
+# --- v0.5.0 review fixes ---
+
+def test_doctor_bandwidth_from_env(capsys, monkeypatch):
+    import json
+    monkeypatch.setenv("SPARKFIT_BANDWIDTH", "136.5")  # half bandwidth -> double efficiency
+    sf.main(["doctor", "--measured-tok-s", "6.8", "--weights-gb", "35.9", "--json"])
+    d = json.loads(capsys.readouterr().out)
+    assert d["bandwidth_gbps"] == pytest.approx(136.5)
+    assert d["calibrated_efficiency"] == pytest.approx(0.894 * 2, abs=0.02)
+
+
+def test_cluster_negative_scaling_rejected():
+    with pytest.raises(SystemExit):
+        sf.main(["cluster", "llama3.1-8b", "-N", "2", "--scaling", "-0.5"])
+
+
+# --- v0.5.0: scan temperature + thermal throttling ---
+
+def test_temp_verdict_thresholds():
+    assert "ok" in sf.temp_verdict(50)
+    assert "warm" in sf.temp_verdict(82)
+    assert "hot" in sf.temp_verdict(90)
+
+
+def test_scan_shows_temperature(capsys, monkeypatch):
+    monkeypatch.setattr(sf, "read_live_mem", lambda: {
+        "gpu": {"total_gb": 128.0, "used_gb": 40.0, "free_gb": 88.0},
+        "thermal": {"temp_c": 62.0, "hw_throttle": False, "sw_throttle": False,
+                    "throttling": False}})
+    sf.main(["scan"])
+    out = capsys.readouterr().out
+    assert "temperature" in out and "62 C" in out
+
+
+def test_scan_warns_on_thermal_throttle(capsys, monkeypatch):
+    monkeypatch.setattr(sf, "read_live_mem", lambda: {
+        "gpu": {"total_gb": 128.0, "used_gb": 100.0, "free_gb": 28.0},
+        "thermal": {"temp_c": 91.0, "hw_throttle": True, "sw_throttle": False,
+                    "throttling": True}})
+    sf.main(["scan"])
+    out = capsys.readouterr().out
+    assert "thermal throttling active" in out and "hardware" in out
+
+
+def test_scan_json_includes_thermal(capsys, monkeypatch):
+    import json
+    monkeypatch.setattr(sf, "read_live_mem", lambda: {
+        "thermal": {"temp_c": 70.0, "throttling": False}})
+    sf.main(["scan", "--json"])
+    assert json.loads(capsys.readouterr().out)["thermal"]["temp_c"] == 70.0
+
+
+# --- v0.5.0: refreshed catalog, --engine flag, review refinements ---
+
+def test_catalog_has_current_models():
+    for m in ["qwen3-8b", "qwen3-32b", "qwen3-235b-a22b", "mistral-small-24b",
+              "phi-4", "deepseek-v3"]:
+        assert m in sf.MODELS
+
+
+def test_qwen3_moe_active_params():
+    s = sf.MODELS["qwen3-235b-a22b"]
+    assert s.get("moe") is True
+    assert s["total_b"] == pytest.approx(235, abs=2)
+    assert s["active_b"] == pytest.approx(22, abs=2)
+
+
+def test_deepseek_v3_uses_mla():
+    assert sf.MODELS["deepseek-v3"].get("kv_style") == "mla"
+
+
+def test_engine_flag_applies_preset(capsys):
+    import json
+    sf.main(["plan", "-m", "llama3.1-8b", "-q", "fp8", "--engine", "vllm", "--json"])
+    eng = json.loads(capsys.readouterr().out)["decode_tok_s"]["per_stream"]
+    sf.main(["plan", "-m", "llama3.1-8b", "-q", "fp8", "--efficiency", "0.85", "--json"])
+    ref = json.loads(capsys.readouterr().out)["decode_tok_s"]["per_stream"]
+    assert eng == pytest.approx(ref, rel=0.01)
+
+
+def test_explicit_efficiency_beats_engine(capsys):
+    import json
+    sf.main(["plan", "-m", "llama3.1-8b", "-q", "fp8", "--engine", "vllm",
+             "--efficiency", "0.50", "--json"])
+    got = json.loads(capsys.readouterr().out)["decode_tok_s"]["per_stream"]
+    sf.main(["plan", "-m", "llama3.1-8b", "-q", "fp8", "--efficiency", "0.50", "--json"])
+    ref = json.loads(capsys.readouterr().out)["decode_tok_s"]["per_stream"]
+    assert got == pytest.approx(ref)
+
+
+def test_default_efficiency_unchanged_by_engine_addition(capsys):
+    import json
+    sf.main(["plan", "-m", "llama3.1-8b", "-q", "fp8", "--json"])
+    default = json.loads(capsys.readouterr().out)["decode_tok_s"]["per_stream"]
+    ref = sf.decode_tok_s(dict(sf.MODELS["llama3.1-8b"]), "fp8", 4096, 1)["per_stream"]
+    assert default == pytest.approx(ref, rel=0.01)  # still BW_EFFICIENCY by default
+
+
+def test_cluster_fabric_scales_multiplier(capsys):
+    import json
+    sf.main(["cluster", "deepseek-r1", "-N", "2", "-q", "q4_k_m", "--fabric-gbps", "100", "--json"])
+    assert json.loads(capsys.readouterr().out)["decode_tok_s"]["scaling_mult"] == pytest.approx(1.25)
+
+
+def test_doctor_clamps_saved_efficiency(tmp_path, capsys, monkeypatch):
+    import json
+    p = str(tmp_path / "rc")
+    monkeypatch.setenv("SPARKFIT_CONFIG", p)
+    sf.main(["doctor", "--measured-tok-s", "100", "--weights-gb", "10", "--save", "--json"])
+    d = json.loads(capsys.readouterr().out)
+    assert d["calibrated_efficiency"] > 1.0            # raw value reported
+    assert float(sf.load_config_file(p)["SPARKFIT_EFFICIENCY"]) <= 1.0  # saved value clamped
+
+
+def test_write_config_preserves_comments_and_unknown(tmp_path):
+    p = tmp_path / "rc"
+    p.write_text("# my notes\nefficiency = 0.7\nmy_custom = keep-me\n")
+    sf.write_config({"efficiency": 0.85}, path=str(p))
+    text = p.read_text()
+    assert "# my notes" in text and "my_custom = keep-me" in text
+    assert "efficiency = 0.85" in text
