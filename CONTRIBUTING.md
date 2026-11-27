@@ -23,8 +23,9 @@ mypy src          # type check
 pytest -q         # tests
 ```
 
-All three run in CI on Python 3.8 to 3.12, so please make sure they pass locally before
-opening a pull request.
+All three run in CI on Python 3.10 to 3.14, so please make sure they pass locally before
+opening a pull request. The tests ignore your own `~/.sparkfitrc` and `SPARKFIT_*`
+variables (see `tests/conftest.py`), so a calibrated setup does not change results.
 
 ## Adding a model to the built-in database
 
@@ -60,12 +61,14 @@ please update both the README "Methodology" section and the tests.
 ## Releases
 
 Every notable change is recorded under "Unreleased" in `CHANGELOG.md`. To cut a
-release, move that section under a dated `X.Y.Z` heading, bump the version in
-`pyproject.toml` and `src/sparkfit.py`, and add longer-form notes as
+release, move that section under a dated `X.Y.Z` heading, bump `__version__` in
+`src/sparkfit.py` (the single source: `pyproject.toml` reads it), and add longer-form
+notes as
 `docs/releases/vX.Y.Z.md` (follow the structure of the existing files). Publish
 the GitHub release with `gh release create vX.Y.Z --notes-file docs/releases/vX.Y.Z.md`.
 
-Pushing a `vX.Y.Z` tag triggers `.github/workflows/release.yml`, which builds the
+Pushing a `vX.Y.Z` tag triggers `.github/workflows/release.yml`, which first checks
+that the tag matches `__version__` and runs ruff, mypy and the tests, then builds the
 sdist and wheel and publishes them to PyPI via
 [Trusted Publishing](https://docs.pypi.org/trusted-publishers/) (OIDC, no API
 token). This requires a one-time setup on PyPI: register this repository and the

@@ -7,7 +7,8 @@ to the latest released version.
 
 | Version | Supported |
 | ------- | --------- |
-| 0.1.x   | yes       |
+| 0.6.x   | yes       |
+| < 0.6   | no        |
 
 ## Reporting a vulnerability
 
@@ -24,5 +25,11 @@ the reporter unless anonymity is requested.
 
 sparkfit performs local computation only. The single network feature is the
 optional Hugging Face auto-fetch, which issues a read-only HTTPS request to
-`huggingface.co` to download a model `config.json`. No telemetry is collected and
-no data leaves the machine otherwise.
+`huggingface.co` to download a model `config.json`. If `HF_TOKEN` (or
+`HUGGING_FACE_HUB_TOKEN`) is set, it is sent to `huggingface.co` only, as a bearer
+token, so gated models can be read. No telemetry is collected and no data leaves
+the machine otherwise.
+
+The only file sparkfit writes is its own config (`~/.sparkfitrc`, or
+`$SPARKFIT_CONFIG`), and only when you run `sparkfit doctor --save`. On the device
+it runs `nvidia-smi` read-only queries for live memory and temperature.

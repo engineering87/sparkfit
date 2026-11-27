@@ -15,7 +15,7 @@ between CPU and GPU). So it answers three questions catalog tools don't:
   3. HOW TO MAKE IT FIT / SCALE - a quantization advisor and a concurrency planner
                        (how many parallel streams / model replicas fit at once).
 
-Pure standard-library Python 3.8+. No external dependencies.
+Pure standard-library Python 3.10+. No external dependencies.
 """
 from __future__ import annotations
 
@@ -29,13 +29,15 @@ import sys
 import urllib.error
 import urllib.request
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 # ---------------------------------------------------------------------------
 # Constants & hardware profile
 # ---------------------------------------------------------------------------
 
 GB = 1_000_000_000  # decimal GB, matches NVIDIA's "128 GB" and common LLM rules
+KIB = 1024          # /proc/meminfo reports KiB (labelled "kB")
+MIB = 1024 * 1024   # nvidia-smi reports MiB; both are converted to decimal GB
 
 # DGX Spark (GB10 Grace Blackwell) reference profile. Override via flags.
 SPARK: dict = {
@@ -50,6 +52,9 @@ SPARK: dict = {
 DEFAULT_OS_RESERVE_GB = 8.0     # DGX OS + Grace CPU side working set
 DEFAULT_FRAMEWORK_GB = 2.0      # CUDA context + serving framework overhead
 BW_EFFICIENCY = 0.70            # fraction of peak bandwidth actually reached
+DEFAULT_QUANT = "q4_k_m"        # quant used when none is given or detected
+REFERENCE_FABRIC_GBPS = 200.0   # ConnectX-7 link the cluster scaling is calibrated on
+MAX_CONCURRENCY_SCAN = 256      # upper bound of `fit --concurrency-scan`
 DEFAULT_MFU = 0.30             # model-FLOPs utilization for the prefill roofline
 
 # Thresholds (named so they are not magic numbers scattered through the code).
@@ -484,8 +489,8 @@ def _envf(name: str, default: "float | None") -> "float | None":
 
 
 def add_workload_flags(p: argparse.ArgumentParser) -> None:
-    """Attach the workload/environment flags shared by plan/advise/fit."""
-    p.add_argument("-q", "--quant", default="q4_k_m", help="quantization (default q4_k_m)")
+    """Attach the workload/environment flags shared by plan/advise/fit/serve/cluster."""
+    p.add_argument("-q", "--quant", default="q4_k_m", help="quantization (default q4_k_m; serve and cluster prefer the one detected from the model config)")
     p.add_argument("-c", "--context", type=_positive_int, default=4096, help="context length")
     p.add_argument("-b", "--batch", type=_positive_int, default=1, help="batch size per stream")
     p.add_argument("-n", "--concurrency", type=_positive_int, default=1, help="concurrent streams/replicas")
@@ -498,13 +503,13 @@ def add_workload_flags(p: argparse.ArgumentParser) -> None:
     p.add_argument("--bandwidth", type=float, default=_envf("SPARKFIT_BANDWIDTH", None),
                    help="override memory bandwidth (GB/s)")
     p.add_argument("--efficiency", type=float, default=None,
-                   help="fraction of peak bandwidth reached (calibrate on your device)")
+                   help="fraction of peak bandwidth reached, 0..1 (default 0.70; calibrate with doctor)")
     p.add_argument("--engine", choices=list(ENGINE_EFFICIENCY), default=None,
                    help="apply a per-engine bandwidth-efficiency preset for this run")
     p.add_argument("--prompt-tokens", type=_positive_int, default=None,
                    help="prompt length for the prefill/TTFT estimate (default: context)")
     p.add_argument("--mfu", type=float, default=_envf("SPARKFIT_MFU", DEFAULT_MFU),
-                   help="model FLOPs utilization for prefill (calibrate on your device)")
+                   help="model FLOPs utilization for prefill, 0..1 (default 0.30)")
     p.add_argument("--compute-tflops", type=float, default=_envf("SPARKFIT_TFLOPS", None),
                    help="override dense FP16 compute in TFLOP/s for prefill")
     p.add_argument("--live", action="store_true",
@@ -546,11 +551,19 @@ def _detect_quant(cfg: dict) -> "str | None":
     if not isinstance(qc, dict):
         return None
     method = str(qc.get("quant_method") or "").lower()
+    # NVIDIA ModelOpt names the algorithm (FP8 / NVFP4 / MXFP4) under quant_algo.
+    algo = str(qc.get("quant_algo") or "").lower()
+    fmt = str(qc.get("format") or "").lower()
     if qc.get("load_in_4bit"):
         return "q4_0"
     if qc.get("load_in_8bit"):
         return "int8"
-    if method == "fp8":
+    # Blackwell-native 4-bit floats: gpt-oss ships MXFP4, ModelOpt/compressed-tensors NVFP4.
+    if method == "mxfp4" or "mxfp4" in algo or "mxfp4" in fmt:
+        return "mxfp4"
+    if method == "nvfp4" or "nvfp4" in algo or "nvfp4" in fmt:
+        return "nvfp4"
+    if method == "fp8" or algo.startswith("fp8"):
         return "fp8"
     bits = qc.get("bits") or qc.get("w_bit") or qc.get("wbits")
     # compressed-tensors nests the width under config_groups[*].weights.num_bits
@@ -559,8 +572,11 @@ def _detect_quant(cfg: dict) -> "str | None":
             w = grp.get("weights") if isinstance(grp, dict) else None
             if isinstance(w, dict) and w.get("num_bits"):
                 bits = w["num_bits"]
-                if str(w.get("type") or "").lower() == "float" and str(bits) == "8":
-                    return "fp8"
+                if str(w.get("type") or "").lower() == "float":
+                    if str(bits) == "8":
+                        return "fp8"
+                    if str(bits) == "4":
+                        return "nvfp4"  # 4-bit float weights: the NVFP4 scheme
                 break
     if bits:
         try:
@@ -785,8 +801,8 @@ def read_live_mem() -> dict:
             out = subprocess.check_output(
                 ["nvidia-smi", "--query-gpu=memory.total,memory.used,memory.free",
                  "--format=csv,noheader,nounits"], text=True, timeout=5)
-            t, u, f = (float(x) for x in out.strip().splitlines()[0].split(","))
-            info["gpu"] = {"total_gb": t / 1024, "used_gb": u / 1024, "free_gb": f / 1024}
+            t, u, f = (float(x) * MIB / GB for x in out.strip().splitlines()[0].split(","))
+            info["gpu"] = {"total_gb": t, "used_gb": u, "free_gb": f}
         except Exception:
             pass
     # Temperature and thermal-throttle status (best effort; field names vary by driver).
@@ -796,18 +812,21 @@ def read_live_mem() -> dict:
                 ["nvidia-smi", "--query-gpu=temperature.gpu",
                  "--format=csv,noheader,nounits"], text=True, timeout=5)
             thermal: dict = {"temp_c": float(out.strip().splitlines()[0])}
-            try:
-                r = subprocess.check_output(
-                    ["nvidia-smi",
-                     "--query-gpu=clocks_throttle_reasons.hw_thermal_slowdown,"
-                     "clocks_throttle_reasons.sw_thermal_slowdown",
-                     "--format=csv,noheader"], text=True, timeout=5)
-                hw, sw = (x.strip().lower() for x in r.strip().splitlines()[0].split(","))
+            # Newer drivers renamed clocks_throttle_reasons.* to clocks_event_reasons.*.
+            for prefix in ("clocks_event_reasons", "clocks_throttle_reasons"):
+                try:
+                    r = subprocess.check_output(
+                        ["nvidia-smi",
+                         f"--query-gpu={prefix}.hw_thermal_slowdown,"
+                         f"{prefix}.sw_thermal_slowdown",
+                         "--format=csv,noheader"], text=True, timeout=5)
+                    hw, sw = (x.strip().lower() for x in r.strip().splitlines()[0].split(","))
+                except Exception:
+                    continue
                 thermal["hw_throttle"] = hw == "active"
                 thermal["sw_throttle"] = sw == "active"
                 thermal["throttling"] = thermal["hw_throttle"] or thermal["sw_throttle"]
-            except Exception:
-                pass
+                break
             info["thermal"] = thermal
         except Exception:
             pass
@@ -817,7 +836,7 @@ def read_live_mem() -> dict:
             mi = {}
             for line in fh:
                 k, _, v = line.partition(":")
-                mi[k] = float(v.strip().split()[0]) / (1024 * 1024)  # kB -> GB
+                mi[k] = float(v.strip().split()[0]) * KIB / GB  # meminfo "kB" is KiB
         info["host"] = {"total_gb": mi.get("MemTotal", 0),
                         "available_gb": mi.get("MemAvailable", 0)}
     except Exception:
@@ -866,11 +885,14 @@ def cmd_quick(args: argparse.Namespace) -> None:
         # Measured/overridden weights: the model exists at one fixed precision, so
         # exploring other quantizations is not meaningful. Report the single config.
         chosen = args.quant or "on-disk"
-        qz0 = args.quant or "fp16"  # quant is unused for the weight term here
+        # The weight term comes from weights_gb; the quant only sets the prefill
+        # compute speedup, so use the detected one (e.g. fp8) when there is one.
+        qz0 = args.quant or spec.get("detected_quant") or "fp16"
         bd = budget(spec, qz0, ctx, 1, conc, args.kv_dtype, args.os_reserve,
                     args.framework, args.total_mem, weights_gb=weights_gb)
         tp = decode_tok_s(spec, qz0, ctx, conc, args.kv_dtype, args.bandwidth,
                           args.efficiency, weights_gb=weights_gb)
+        compute_quant = qz0
     else:
         auto = first_fit = None
         for qz in QUANT_LADDER:
@@ -888,8 +910,9 @@ def cmd_quick(args: argparse.Namespace) -> None:
         bd = budget(spec, chosen, ctx, 1, conc, args.kv_dtype, args.os_reserve,
                     args.framework, args.total_mem)
         tp = decode_tok_s(spec, chosen, ctx, conc, args.kv_dtype, args.bandwidth, args.efficiency)
+        compute_quant = chosen
 
-    pf = prefill_stats(spec, chosen, args.prompt_tokens or ctx, args.bandwidth,
+    pf = prefill_stats(spec, compute_quant, args.prompt_tokens or ctx, args.bandwidth,
                        args.efficiency, args.compute_tflops, args.mfu,
                        weights_gb=weights_gb)
 
@@ -1082,7 +1105,7 @@ def cmd_fit(args: argparse.Namespace) -> None:
         spec = resolve_model(args)
         rows = []
         n = 1
-        while n <= 256:
+        while n <= MAX_CONCURRENCY_SCAN:
             bd = budget(spec, args.quant, args.context, args.batch, n,
                         args.kv_dtype, args.os_reserve, args.framework, args.total_mem)
             if not bd["fits"]:
@@ -1092,9 +1115,10 @@ def cmd_fit(args: argparse.Namespace) -> None:
             rows.append((n, bd, tp))
             n += 1
         max_n = rows[-1][0] if rows else 0
+        capped = max_n == MAX_CONCURRENCY_SCAN  # still fits at the scan limit
         if args.json:
             print(json.dumps({"model": spec["name"], "quant": args.quant,
-                              "max_concurrency": max_n}, indent=2))
+                              "max_concurrency": max_n, "capped": capped}, indent=2))
             return
         print()
         print(bold(f"  Max concurrency | {spec['name']} | {args.quant} | ctx {args.context}"))
@@ -1103,8 +1127,11 @@ def cmd_fit(args: argparse.Namespace) -> None:
             print("  " + red("> does not fit even at 1 stream; reduce -c/-q "
                               "or pick a smaller model"))
         else:
-            print("  " + green(f"> up to {max_n} concurrent stream(s) fit in "
+            more = "+" if capped else ""
+            print("  " + green(f"> up to {max_n}{more} concurrent stream(s) fit in "
                                f"{(args.total_mem or SPARK['total_mem_gb']):.0f} GB"))
+            if capped:
+                print(dim(f"    (scan stops at {MAX_CONCURRENCY_SCAN} streams; more may fit)"))
         if rows:
             last = rows[-1]
             print(dim(f"    at {max_n} streams: {fmt_gb(last[1]['used']).strip()} used | "
@@ -1148,6 +1175,30 @@ def cmd_fit(args: argparse.Namespace) -> None:
     print()
 
 
+def split_serve_token(token: str) -> "tuple[str, str | None, str | None]":
+    """Split a `serve` spec NAME[:quant[:context]] into (name, quant, context).
+
+    The model part may itself contain ':' (a URL, or a Windows path such as
+    C:\\models\\x), so suffixes are peeled from the right and never past a drive
+    letter or an existing path.
+    """
+    if "://" in token or os.path.exists(token):
+        return token, None, None
+    head = token
+    suffixes: list = []
+    for _ in range(2):
+        if os.path.exists(head):
+            break
+        base, sep, tail = head.rpartition(":")
+        if not sep or re.fullmatch(r"[A-Za-z]", base):
+            break
+        suffixes.insert(0, tail)
+        head = base
+    quant = suffixes[0] if suffixes and suffixes[0] else None
+    ctx = suffixes[1] if len(suffixes) > 1 and suffixes[1] else None
+    return head, quant, ctx
+
+
 def cmd_serve(args: argparse.Namespace) -> None:
     """Plan several models co-served on one Spark: shared memory and shared bandwidth.
 
@@ -1160,19 +1211,15 @@ def cmd_serve(args: argparse.Namespace) -> None:
     total = (args.total_mem if args.total_mem is not None else SPARK["total_mem_gb"]) * GB
     if total <= 0:
         raise SystemExit("--total-mem must be a positive number of GB.")
+    streams = args.batch * args.concurrency  # per model
     rows = []
     for token in args.models:
-        if "://" in token:  # a full URL: no quant/context suffix to split off
-            parts = [token]
-        else:
-            parts = token.split(":")
-        name = parts[0]
-        q = parts[1] if len(parts) > 1 and parts[1] else None
-        if len(parts) > 2 and parts[2]:
+        name, q, ctx_raw = split_serve_token(token)
+        if ctx_raw:
             try:
-                ctx = int(parts[2])
+                ctx = int(ctx_raw)
             except ValueError:
-                raise SystemExit(f"Bad context in '{token}': '{parts[2]}' is not an integer.")
+                raise SystemExit(f"Bad context in '{token}': '{ctx_raw}' is not an integer.")
         else:
             ctx = args.context
         if ctx < 1:
@@ -1181,13 +1228,15 @@ def cmd_serve(args: argparse.Namespace) -> None:
         quant = q or spec.get("detected_quant") or args.quant
         wgb = spec.get("weights_gb")
         w = wgb * GB if wgb else weight_bytes(spec["total_b"], quant)
-        kv = kv_total_bytes(spec, ctx, 1, args.kv_dtype)
-        act = activation_bytes(spec, ctx, 1)
-        alone = decode_tok_s(spec, quant, ctx, 1, args.kv_dtype, args.bandwidth,
+        kv = kv_total_bytes(spec, ctx, streams, args.kv_dtype)
+        act = activation_bytes(spec, ctx, streams)
+        alone = decode_tok_s(spec, quant, ctx, streams, args.kv_dtype, args.bandwidth,
                              args.efficiency, weights_gb=wgb)["per_stream"]
+        pf = prefill_stats(spec, quant, args.prompt_tokens or ctx, args.bandwidth,
+                           args.efficiency, args.compute_tflops, args.mfu, weights_gb=wgb)
         rows.append({"name": spec["name"], "quant": quant, "context": ctx,
                      "weights": w, "kv": kv, "act": act, "total": w + kv + act,
-                     "alone": alone})
+                     "alone": alone, "ttft": pf["ttft_s"]})
     n = len(rows)
     for r in rows:
         r["contended"] = r["alone"] / n  # worst case: N models decoding at once
@@ -1203,8 +1252,9 @@ def cmd_serve(args: argparse.Namespace) -> None:
                         "kv_gb": round(r["kv"] / GB, 2),
                         "total_gb": round(r["total"] / GB, 2),
                         "tok_s_alone": round(r["alone"], 1),
-                        "tok_s_contended": round(r["contended"], 1)} for r in rows],
-            "active_models": n,
+                        "tok_s_contended": round(r["contended"], 1),
+                        "prefill_ttft_s": round(r["ttft"], 2)} for r in rows],
+            "active_models": n, "streams_per_model": streams,
             "memory_gb": {"used": round(used / GB, 2), "total": round(total / GB, 2),
                           "overhead": round(overhead / GB, 2),
                           "headroom": round((total - used) / GB, 2)},
@@ -1212,7 +1262,9 @@ def cmd_serve(args: argparse.Namespace) -> None:
         return
 
     print()
-    print(bold(f"  Co-serving on {SPARK['name']}  |  {n} models  |  {total / GB:.0f} GB unified"))
+    per_model = f"  |  {streams} streams each" if streams > 1 else ""
+    print(bold(f"  Co-serving on {SPARK['name']}  |  {n} models  |  {total / GB:.0f} GB unified"
+               f"{per_model}"))
     print()
     print(dim(f"  {'model':<20}{'quant':>8}{'ctx':>8}{'weights':>10}{'KV':>8}"
               f"{'total':>9}{'alone':>8}{'shared':>8}"))
@@ -1248,10 +1300,12 @@ def cmd_cluster(args: argparse.Namespace) -> None:
     per-node scaling factor (default 0.5 added per extra node) is calibratable.
     """
     apply_live(args)  # --live plans each node against its currently-free memory
-    if args.scaling < 0:
-        raise SystemExit("--scaling must be >= 0.")
+    if not 0 <= args.scaling <= 1:
+        raise SystemExit("--scaling must be between 0 and 1.")
+    if args.fabric_gbps <= 0:
+        raise SystemExit("--fabric-gbps must be a positive number of Gb/s.")
     spec = resolve_target(args.model)
-    quant = args.quant
+    quant = args.quant or spec.get("detected_quant") or DEFAULT_QUANT
     weights_gb = args.weights_gb if args.weights_gb is not None else spec.get("weights_gb")
     n = args.nodes
     node_total = (args.total_mem if args.total_mem is not None else SPARK["total_mem_gb"]) * GB
@@ -1270,7 +1324,10 @@ def cmd_cluster(args: argparse.Namespace) -> None:
 
     one = decode_tok_s(spec, quant, args.context, streams, args.kv_dtype,
                        args.bandwidth, args.efficiency, weights_gb=weights_gb)
-    mult = 1 + (n - 1) * args.scaling * (args.fabric_gbps / 200.0)  # slower fabric -> less gain
+    # A slower fabric lowers the gain; a faster one cannot push past the per-node
+    # scaling factor, so N nodes never exceed N x one node.
+    fabric_factor = min(args.fabric_gbps / REFERENCE_FABRIC_GBPS, 1.0)
+    mult = 1 + (n - 1) * args.scaling * fabric_factor
     if args.parallelism == "tp":
         per_stream = one["per_stream"] * mult      # tensor parallel speeds up one stream
         aggregate = per_stream * streams
@@ -1359,7 +1416,8 @@ def cmd_doctor(args: argparse.Namespace) -> None:
         if args.model:
             spec = resolve_target(args.model)
             wgb = args.weights_gb if args.weights_gb is not None else spec.get("weights_gb")
-            active = wgb * GB if (wgb and wgb > 0) else weight_bytes(spec["active_b"], args.quant)
+            quant = args.quant or spec.get("detected_quant") or DEFAULT_QUANT
+            active = wgb * GB if (wgb and wgb > 0) else weight_bytes(spec["active_b"], quant)
             bytes_step = active + kv_per_token_bytes(spec, args.kv_dtype) * effective_context(spec, args.context)
         elif args.weights_gb:
             bytes_step = args.weights_gb * GB
@@ -1523,7 +1581,11 @@ def build_parser() -> argparse.ArgumentParser:
                "  sparkfit advise -m qwen2.5-72b -c 16384\n"
                "  sparkfit fit -q q4_k_m -c 4096\n"
                "  sparkfit fit -m llama3.1-8b --concurrency-scan\n"
-               "  sparkfit scan",
+               "  sparkfit serve qwen2.5-7b:fp8:8192 llama3.2-3b:fp8:2048\n"
+               "  sparkfit cluster deepseek-r1 -N 4 -q q4_k_m\n"
+               "  sparkfit doctor --measured-tok-s 6.8 --weights-gb 35.9 --save\n"
+               "  sparkfit scan\n"
+               "  sparkfit llama3.1-70b     (bare model: one-shot quick report)",
         formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--version", "-V", action="version",
                    version="sparkfit " + __version__)
@@ -1551,7 +1613,8 @@ def build_parser() -> argparse.ArgumentParser:
     sv = sub.add_parser("serve",
                         help="plan several models co-served on one Spark (shared memory + bandwidth)")
     sv.add_argument("models", nargs="+",
-                    help="model specs NAME[:quant[:context]] (e.g. deepseek-r1:fp8:8192)")
+                    help="model specs NAME[:quant[:context]]; NAME is a catalog id, "
+                         "Hugging Face id or local path (e.g. deepseek-r1:fp8:8192)")
     add_workload_flags(sv)
     sv.set_defaults(func=cmd_serve)
 
@@ -1562,13 +1625,15 @@ def build_parser() -> argparse.ArgumentParser:
     cl.add_argument("--parallelism", choices=["pp", "tp"], default="pp",
                     help="pipeline (default, capacity+throughput) or tensor (single-stream latency)")
     cl.add_argument("--fabric-gbps", type=float, default=200.0,
-                    help="inter-node fabric bandwidth in Gb/s (default 200)")
+                    help="inter-node fabric bandwidth in Gb/s (default 200); slower "
+                         "lowers the speedup, faster does not raise it")
     cl.add_argument("--scaling", type=float, default=0.5,
                     help="aggregate throughput added per extra node, 0..1 (default 0.5)")
     cl.add_argument("--weights-gb", type=float, default=None,
                     help="override weight footprint in GB")
     add_workload_flags(cl)
-    cl.set_defaults(func=cmd_cluster)
+    # No fixed quant default: use the one detected from the model's config, if any.
+    cl.set_defaults(func=cmd_cluster, quant=None)
 
     dr = sub.add_parser("doctor",
                         help="calibrate sparkfit to your device and save the settings")
@@ -1576,7 +1641,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help="a measured single-stream decode tok/s to calibrate efficiency")
     dr.add_argument("-m", "--model", help="model for the measured point (id / HF / local path)")
     dr.add_argument("--weights-gb", type=float, help="weight size in GB (if not using --model)")
-    dr.add_argument("-q", "--quant", default="q4_k_m")
+    dr.add_argument("-q", "--quant", default=None,
+                    help=f"quant of the measured model (default: detected, else {DEFAULT_QUANT})")
     dr.add_argument("-c", "--context", type=_positive_int, default=4096)
     dr.add_argument("--kv-dtype", default="fp16", choices=list(KV_BYTES))
     dr.add_argument("--bandwidth", type=float, default=_envf("SPARKFIT_BANDWIDTH", None))
@@ -1620,8 +1686,56 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _ensure_utf8_output() -> None:
+    """Make stdout/stderr able to print the report's box-drawing glyphs.
+
+    On Windows a redirected or piped stream uses the ANSI code page (cp1252), which
+    cannot encode characters like the bars and check marks, so printing would crash.
+    Switch such streams to UTF-8 (and never fail on an unencodable character).
+    """
+    for stream in (sys.stdout, sys.stderr):
+        enc = (getattr(stream, "encoding", None) or "").lower().replace("-", "")
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None or enc in ("utf8", "utf8sig"):
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (ValueError, OSError):
+            pass
+
+
+def _check_range(args: argparse.Namespace, attr: str, flag: str, *, low: float = 0.0,
+                 high: "float | None" = None, inclusive_low: bool = False) -> None:
+    """Reject an out-of-range numeric option with a clear message (None = not set)."""
+    val = getattr(args, attr, None)
+    if val is None:
+        return
+    too_low = val < low if inclusive_low else val <= low
+    if too_low or (high is not None and val > high):
+        rng = (f"{'>=' if inclusive_low else '>'} {low:g}"
+               + (f" and <= {high:g}" if high is not None else ""))
+        raise SystemExit(f"{flag} must be {rng}, got {val:g}.")
+
+
+def validate_args(args: argparse.Namespace) -> None:
+    """Validate the numeric knobs shared by the subcommands (after defaults resolve)."""
+    _check_range(args, "efficiency", "--efficiency (or SPARKFIT_EFFICIENCY)", high=1.0)
+    _check_range(args, "mfu", "--mfu (or SPARKFIT_MFU)", high=1.0)
+    _check_range(args, "os_reserve", "--os-reserve", inclusive_low=True)
+    _check_range(args, "framework", "--framework", inclusive_low=True)
+    _check_range(args, "total_mem", "--total-mem")
+    _check_range(args, "bandwidth", "--bandwidth")
+    _check_range(args, "compute_tflops", "--compute-tflops")
+    _check_range(args, "weights_gb", "--weights-gb")
+    _check_range(args, "fabric_gbps", "--fabric-gbps")
+    _check_range(args, "scaling", "--scaling", high=1.0, inclusive_low=True)
+
+
 def main(argv: list[str] | None = None) -> None:
     """Entry point. Routes a bare model argument to the quick subcommand."""
+    global _CONFIG
+    _ensure_utf8_output()
+    _CONFIG = load_config_file()  # re-read so $SPARKFIT_CONFIG set at runtime applies
     argv = list(sys.argv[1:] if argv is None else argv)
     known = {"plan", "advise", "fit", "serve", "cluster", "doctor", "scan", "models",
              "quick", "-h", "--help", "--version", "-V"}
@@ -1634,6 +1748,7 @@ def main(argv: list[str] | None = None) -> None:
     if hasattr(args, "efficiency") and args.efficiency is None:
         eng = getattr(args, "engine", None)
         args.efficiency = ENGINE_EFFICIENCY[eng] if eng else _envf("SPARKFIT_EFFICIENCY", BW_EFFICIENCY)
+    validate_args(args)
     args.func(args)
 
 

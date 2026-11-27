@@ -6,6 +6,56 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- Quantization auto-detect now recognizes the Blackwell-native 4-bit formats: MXFP4
+  (`quant_method: "mxfp4"`, as shipped by gpt-oss) and NVFP4 (ModelOpt `quant_algo`,
+  and compressed-tensors 4-bit float weights). ModelOpt FP8 is detected too.
+- `serve` now honours `-b/--batch` and `-n/--concurrency` (streams per model, which
+  grow each model's KV-cache and split its decode speed) and reports a per-model
+  prefill / time-to-first-token estimate in `--json` (`prefill_ttft_s`).
+- `fit --concurrency-scan` reports when it hits the 256-stream scan limit
+  (`"capped": true` in JSON, `256+` in text).
+
+### Changed
+- `cluster` and `doctor` default to the quantization detected from the model's
+  config (as `quick` and `serve` already did), falling back to `q4_k_m`.
+- `cluster` caps the fabric factor at the 200 Gb/s reference, so N nodes never
+  report more than N x one node, and rejects a non-positive `--fabric-gbps` or a
+  `--scaling` outside 0..1.
+- Numeric options are validated up front: `--efficiency` and `--mfu` must be in
+  (0, 1]; `--os-reserve` and `--framework` >= 0; `--total-mem`, `--bandwidth`,
+  `--compute-tflops` and `--weights-gb` > 0. Out-of-range values (including from
+  `SPARKFIT_*` or the config file) now stop with a clear message instead of being
+  silently replaced by the default.
+- Live telemetry (`scan`, `--live`, `doctor`) converts nvidia-smi MiB and
+  `/proc/meminfo` KiB to decimal GB, consistent with the rest of the tool
+  (previously GiB were treated as GB, understating free memory by about 7%).
+- Thermal-throttle status is read from `clocks_event_reasons.*` on newer drivers,
+  falling back to the older `clocks_throttle_reasons.*`.
+- With measured on-disk weights, the prefill estimate uses the detected
+  quantization (e.g. FP8) for the compute speedup.
+- Python 3.10+ is now required (3.8 and 3.9 are end-of-life); CI covers 3.10-3.14.
+- Packaging: the version is read from `sparkfit.__version__` (single source), the
+  license uses an SPDX expression, and the release workflow runs the tests and
+  checks that the tag matches the package version before publishing.
+- Docs: the README covers `cluster`, quantization auto-detect, the `serve` spec
+  format and option ranges, and fixes the calibration example (6.8 tok/s on
+  35.9 GB is about 0.89 efficiency, not 0.85); SECURITY lists supported versions
+  and what leaves the machine (the optional `HF_TOKEN`); `--help` shows more
+  examples and the option ranges.
+
+### Fixed
+- Windows: redirecting or piping the output (`sparkfit llama3.1-8b > out.txt`) no
+  longer crashes with `UnicodeEncodeError`; such streams are switched to UTF-8.
+- `serve` accepts Windows paths (`C:\models\x[:quant[:ctx]]`) instead of splitting
+  them at the drive letter.
+- The config file is re-read on every run, so `$SPARKFIT_CONFIG` set after import
+  takes effect; the test suite no longer depends on the developer's `~/.sparkfitrc`.
+
+### Removed
+- A stale copy of the source (`outputs_sparkfit_copy.py`) that had been committed
+  by mistake.
+
 ## [0.5.0] - 2026-07-31
 
 ### Added
