@@ -12,6 +12,7 @@ What does this change and why?
 ## Checklist
 
 - [ ] `ruff check .` passes
+- [ ] `mypy src` passes
 - [ ] `pytest -q` passes
 - [ ] Added or updated tests where relevant
 - [ ] Updated the README "Methodology" section if the math changed

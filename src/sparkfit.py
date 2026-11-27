@@ -15,7 +15,7 @@ between CPU and GPU). So it answers three questions catalog tools don't:
   3. HOW TO MAKE IT FIT / SCALE - a quantization advisor and a concurrency planner
                        (how many parallel streams / model replicas fit at once).
 
-Pure standard-library Python 3.8+. No external dependencies.
+Pure standard-library Python 3.10+. No external dependencies.
 """
 from __future__ import annotations
 
@@ -29,27 +29,50 @@ import sys
 import urllib.error
 import urllib.request
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 # ---------------------------------------------------------------------------
 # Constants & hardware profile
 # ---------------------------------------------------------------------------
 
 GB = 1_000_000_000  # decimal GB, matches NVIDIA's "128 GB" and common LLM rules
+KIB = 1024          # /proc/meminfo reports KiB (labelled "kB")
+MIB = 1024 * 1024   # nvidia-smi reports MiB; both are converted to decimal GB
 
 # DGX Spark (GB10 Grace Blackwell) reference profile. Override via flags.
 SPARK: dict = {
     "name": "NVIDIA DGX Spark (GB10)",
     "total_mem_gb": 128.0,      # advertised unified LPDDR5x
     "bandwidth_gbps": 273.0,    # 273 GB/s shared CPU+GPU, the real bottleneck
-    "fp4_tops": 1000.0,         # ~1 PFLOP FP4 (sparse)
-    "fp16_tflops": 125.0,       # approx dense BF16/FP16 compute (FP4 peak / 4)
+    "fp4_tops": 1000.0,         # ~1 PFLOP FP4 (sparse, marketing peak)
+    # Dense BF16 matmul throughput actually reached on GB10 (measured MAMF/GEMM
+    # benchmarks report ~99-100 TFLOPS; the theoretical figure is ~125).
+    "fp16_tflops": 100.0,
 }
+
+# Achievable dense matmul throughput of low-precision formats relative to BF16 on
+# GB10, from measured GEMM benchmarks (FP8 ~197-208 TFLOPS, NVFP4 ~347 TFLOPS).
+FP8_COMPUTE_MULT = 2.0
+FP4_COMPUTE_MULT = 3.5
+# Engines that dequantize to higher precision for matmuls (GGUF / llama.cpp kernels)
+# get no tensor-core speedup from low-precision weights during prefill.
+DEQUANT_ENGINES = ("llama.cpp", "ollama")
+# MoE prefill runs many small per-expert (grouped) GEMMs, which reach a lower
+# fraction of peak than one big dense GEMM: scale the MFU down for MoE models.
+MOE_PREFILL_MFU_FACTOR = 0.5
 
 # Default chunks of memory you cannot use for a model on a unified system.
 DEFAULT_OS_RESERVE_GB = 8.0     # DGX OS + Grace CPU side working set
 DEFAULT_FRAMEWORK_GB = 2.0      # CUDA context + serving framework overhead
 BW_EFFICIENCY = 0.70            # fraction of peak bandwidth actually reached
+DEFAULT_QUANT = "q4_k_m"        # quant used when none is given or detected
+# Fixed time per decode step on top of streaming the bytes (kernel launches,
+# sampling, scheduling, MoE routing). Fitted to published GB10 single-stream runs:
+# ~4 ms explains small/MoE models (qwen3-30b-a3b, gpt-oss) without moving 8B+
+# dense models, whose 70-80 ms steps are pure bandwidth.
+DEFAULT_STEP_OVERHEAD_MS = 4.0
+REFERENCE_FABRIC_GBPS = 200.0   # ConnectX-7 link the cluster scaling is calibrated on
+MAX_CONCURRENCY_SCAN = 256      # upper bound of `fit --concurrency-scan`
 DEFAULT_MFU = 0.30             # model-FLOPs utilization for the prefill roofline
 
 # Thresholds (named so they are not magic numbers scattered through the code).
@@ -86,25 +109,25 @@ MODELS: dict[str, dict] = {
     "llama3.1-70b":  dict(total_b=70.6,  active_b=70.6,  layers=80, hidden=8192,  kv_heads=8,  head_dim=128),
     "llama3.1-405b": dict(total_b=405.0, active_b=405.0, layers=126,hidden=16384, kv_heads=8,  head_dim=128),
     "mistral-7b":    dict(total_b=7.24,  active_b=7.24,  layers=32, hidden=4096,  kv_heads=8,  head_dim=128),
-    "mixtral-8x7b":  dict(total_b=46.7,  active_b=12.9,  layers=32, hidden=4096,  kv_heads=8,  head_dim=128, moe=True),
+    "mixtral-8x7b":  dict(total_b=46.7,  active_b=12.9,  layers=32, hidden=4096,  kv_heads=8,  head_dim=128, moe=True, n_experts=8, top_k=2),
     "qwen2.5-7b":    dict(total_b=7.6,   active_b=7.6,   layers=28, hidden=3584,  kv_heads=4,  head_dim=128),
     "qwen2.5-14b":   dict(total_b=14.7,  active_b=14.7,  layers=48, hidden=5120,  kv_heads=8,  head_dim=128),
     "qwen2.5-32b":   dict(total_b=32.5,  active_b=32.5,  layers=64, hidden=5120,  kv_heads=8,  head_dim=128),
     "qwen2.5-72b":   dict(total_b=72.7,  active_b=72.7,  layers=80, hidden=8192,  kv_heads=8,  head_dim=128),
     "gemma2-9b":     dict(total_b=9.24,  active_b=9.24,  layers=42, hidden=3584,  kv_heads=8,  head_dim=256),
     "gemma2-27b":    dict(total_b=27.2,  active_b=27.2,  layers=46, hidden=4608,  kv_heads=16, head_dim=128),
-    "gpt-oss-20b":   dict(total_b=21.0,  active_b=3.6,   layers=24, hidden=2880,  kv_heads=8,  head_dim=64,  moe=True),
-    "gpt-oss-120b":  dict(total_b=117.0, active_b=5.1,   layers=36, hidden=2880,  kv_heads=8,  head_dim=64,  moe=True),
-    "deepseek-v2-lite": dict(total_b=15.7,  active_b=2.4,  layers=27, hidden=2048, kv_heads=16,  head_dim=128, moe=True, kv_style="mla", mla_dim=576),
-    "deepseek-r1":      dict(total_b=671.0, active_b=37.0, layers=61, hidden=7168, kv_heads=128, head_dim=128, moe=True, kv_style="mla", mla_dim=576),
+    "gpt-oss-20b":   dict(total_b=21.0,  active_b=3.6,   layers=24, hidden=2880,  kv_heads=8,  head_dim=64,  moe=True, n_experts=32, top_k=4, detected_quant="mxfp4"),
+    "gpt-oss-120b":  dict(total_b=117.0, active_b=5.1,   layers=36, hidden=2880,  kv_heads=8,  head_dim=64,  moe=True, n_experts=128, top_k=4, detected_quant="mxfp4"),
+    "deepseek-v2-lite": dict(total_b=15.7,  active_b=2.4,  layers=27, hidden=2048, kv_heads=16,  head_dim=128, moe=True, n_experts=64, top_k=6, kv_style="mla", mla_dim=576),
+    "deepseek-r1":      dict(total_b=671.0, active_b=37.0, layers=61, hidden=7168, kv_heads=128, head_dim=128, moe=True, n_experts=256, top_k=8, kv_style="mla", mla_dim=576),
     "qwen3-8b":         dict(total_b=8.2,   active_b=8.2,   layers=36, hidden=4096,  kv_heads=8,   head_dim=128),
     "qwen3-14b":        dict(total_b=14.8,  active_b=14.8,  layers=40, hidden=5120,  kv_heads=8,   head_dim=128),
     "qwen3-32b":        dict(total_b=32.8,  active_b=32.8,  layers=64, hidden=5120,  kv_heads=8,   head_dim=128),
-    "qwen3-30b-a3b":    dict(total_b=30.5,  active_b=3.4,   layers=48, hidden=2048,  kv_heads=4,   head_dim=128, moe=True),
-    "qwen3-235b-a22b":  dict(total_b=235.1, active_b=22.2,  layers=94, hidden=4096,  kv_heads=4,   head_dim=128, moe=True),
+    "qwen3-30b-a3b":    dict(total_b=30.5,  active_b=3.4,   layers=48, hidden=2048,  kv_heads=4,   head_dim=128, moe=True, n_experts=128, top_k=8),
+    "qwen3-235b-a22b":  dict(total_b=235.1, active_b=22.2,  layers=94, hidden=4096,  kv_heads=4,   head_dim=128, moe=True, n_experts=128, top_k=8),
     "mistral-small-24b":dict(total_b=23.6,  active_b=23.6,  layers=40, hidden=5120,  kv_heads=8,   head_dim=128),
     "phi-4":            dict(total_b=14.7,  active_b=14.7,  layers=40, hidden=5120,  kv_heads=10,  head_dim=128),
-    "deepseek-v3":      dict(total_b=671.0, active_b=37.6,  layers=61, hidden=7168,  kv_heads=128, head_dim=128, moe=True, kv_style="mla", mla_dim=576),
+    "deepseek-v3":      dict(total_b=671.0, active_b=37.6,  layers=61, hidden=7168,  kv_heads=128, head_dim=128, moe=True, n_experts=256, top_k=8, kv_style="mla", mla_dim=576),
 }
 
 # ---------------------------------------------------------------------------
@@ -166,16 +189,44 @@ def weight_bytes(params_b: float, quant: str) -> float:
     return params_b * 1e9 * quant_bits(quant) / 8.0
 
 
-def _compute_mult(quant: str) -> float:
-    """Relative matmul throughput of a weight precision on Blackwell tensor cores.
-    Only formats with native low-precision matmul (fp8, fp4) run faster; GGUF-style
-    quants dequantize to fp16 for compute, so they get no prefill speedup."""
+def _compute_mult(quant: str, engine: "str | None" = None) -> float:
+    """Relative matmul throughput of a weight precision on GB10 tensor cores.
+
+    Only formats with native low-precision matmul (fp8, fp4) run faster, and only
+    on engines that use those kernels; GGUF-style quants, and engines that
+    dequantize (llama.cpp, ollama), compute in 16-bit and get no prefill speedup.
+    """
+    if engine in DEQUANT_ENGINES:
+        return 1.0
     q = quant.lower()
     if q in ("fp8", "int8"):
-        return 2.0
+        return FP8_COMPUTE_MULT
     if q in ("nvfp4", "fp4", "mxfp4"):
-        return 4.0
+        return FP4_COMPUTE_MULT
     return 1.0
+
+
+def streamed_params_b(spec: dict, batch: int = 1) -> float:
+    """Billions of weights read from memory per decode step for `batch` streams.
+
+    A dense model reads every weight once per step whatever the batch. A
+    Mixture-of-Experts reads its always-on part (attention, embeddings, shared
+    experts) plus every routed expert that at least one token in the batch picked:
+    with E experts, top-k routing and B tokens, about E * (1 - (1 - k/E)^B) distinct
+    experts per layer (uniform routing; real routing skew touches a few less). So at
+    batch 1 a MoE streams only its active parameters, while a large batch streams
+    close to the whole model. Without expert counts the active size is used.
+    """
+    # A vision tower (multimodal) is resident but not part of the expert pool.
+    total = spec["total_b"] - (spec.get("vision_b") or 0.0)
+    active = spec["active_b"]
+    n_exp, top_k = spec.get("n_experts") or 0, spec.get("top_k") or 0
+    if not (spec.get("moe") and n_exp > top_k > 0 and total > active):
+        return active
+    per_expert = (total - active) / (n_exp - top_k)   # params of one routed expert (all layers)
+    always_on = active - top_k * per_expert
+    touched = n_exp * (1.0 - (1.0 - top_k / n_exp) ** max(int(batch), 1))
+    return min(always_on + touched * per_expert, total)
 
 
 def kv_per_token_bytes(spec: dict, kv_dtype: str = "fp16") -> float:
@@ -238,45 +289,85 @@ def budget(spec: dict, quant: str, context: int, batch: int, concurrency: int = 
     }
 
 
+def streamed_weight_bytes(spec: dict, quant: str, batch: int = 1,
+                          weights_gb: "float | None" = None) -> float:
+    """Bytes of weights read per decode step (see `streamed_params_b`)."""
+    params = streamed_params_b(spec, batch)
+    if weights_gb and weights_gb > 0:
+        total = spec["total_b"]
+        return weights_gb * GB * (params / total if total > 0 else 1.0)
+    return weight_bytes(params, quant)
+
+
 def decode_tok_s(spec: dict, quant: str, context: int, batch: int = 1,
                  kv_dtype: str = "fp16", bandwidth: float | None = None,
                  efficiency: float = BW_EFFICIENCY,
-                 weights_gb: float | None = None) -> dict:
+                 weights_gb: float | None = None,
+                 overhead_ms: "float | None" = DEFAULT_STEP_OVERHEAD_MS) -> dict:
     """Memory-bandwidth roofline for decode (token generation) speed.
 
-    Decode is memory-bound: each step streams the (active) weights once plus the
+    Decode is memory-bound: each step streams the weights the batch needs once (for
+    a MoE, the experts its tokens were routed to, see `streamed_params_b`) plus the
     whole KV-cache. This is exactly why Spark's 273 GB/s caps tok/s.
+    `weights_gb` is the measured size of the whole model; the streamed share of it
+    is taken in proportion to the parameters read.
+
+    Every step also pays a fixed cost that does not shrink with the model (kernel
+    launches, sampling, scheduling, MoE routing): `overhead_ms`. It is negligible
+    for big dense models and dominant for small or few-active-parameter MoE ones.
     """
     band = bandwidth if (bandwidth and bandwidth > 0) else SPARK["bandwidth_gbps"]
     eff = efficiency if (efficiency and efficiency > 0) else BW_EFFICIENCY
     bw = band * 1e9 * eff
-    w_active = weights_gb * GB if (weights_gb and weights_gb > 0) else weight_bytes(spec["active_b"], quant)
+    w_active = streamed_weight_bytes(spec, quant, batch, weights_gb)
     kv_step = kv_per_token_bytes(spec, kv_dtype) * effective_context(spec, context) * batch
     bytes_per_step = max(w_active + kv_step, 1.0)
-    agg = batch * bw / bytes_per_step      # aggregate tokens/s across the batch
+    fixed_s = max(overhead_ms or 0.0, 0.0) / 1000.0
+    step_s = bytes_per_step / bw + fixed_s
+    agg = batch / step_s                   # aggregate tokens/s across the batch
     per = agg / batch if batch else 0.0    # tokens/s seen by one stream
-    return {"aggregate": agg, "per_stream": per, "bytes_per_step": bytes_per_step}
+    return {"aggregate": agg, "per_stream": per, "bytes_per_step": bytes_per_step,
+            "step_time_ms": step_s * 1000.0}
+
+
+def prefill_flops(spec: dict, prompt_tokens: int) -> float:
+    """FLOPs to prefill a prompt: 2 per active weight per token plus attention."""
+    t = max(int(prompt_tokens), 1)
+    return 2 * spec["active_b"] * 1e9 * t + 2 * spec["layers"] * t * t * spec["hidden"]
+
+
+def prefill_peak_flops(spec: dict, quant: str, tflops: "float | None" = None,
+                       mfu: "float | None" = DEFAULT_MFU,
+                       engine: "str | None" = None, apply_mfu: bool = True) -> float:
+    """Effective FLOP/s for prefill. With apply_mfu=False, the ceiling before MFU
+    (used by `doctor` to back the MFU out of a measured time-to-first-token)."""
+    tf = tflops if (tflops and tflops > 0) else SPARK["fp16_tflops"]
+    peak = tf * 1e12 * _compute_mult(quant, engine)
+    if spec.get("moe"):
+        peak *= MOE_PREFILL_MFU_FACTOR
+    if apply_mfu:
+        peak *= mfu if (mfu and mfu > 0) else DEFAULT_MFU
+    return peak
 
 
 def prefill_stats(spec: dict, quant: str, prompt_tokens: int,
                   bandwidth: float | None = None, efficiency: float = BW_EFFICIENCY,
                   tflops: float | None = None, mfu: float = DEFAULT_MFU,
-                  weights_gb: float | None = None) -> dict:
+                  weights_gb: float | None = None, engine: "str | None" = None) -> dict:
     """Prefill / time-to-first-token roofline: max(compute-bound, bandwidth-bound).
 
     Prefill processes the whole prompt in one shot, so it is compute-bound for long
     prompts and bandwidth-bound (stream the weights once) for short ones. FLOPs use
     the active parameters plus the quadratic attention term; the memory floor is a
-    single read of the resident weights.
+    single read of the resident weights. The compute side uses the dense BF16
+    throughput actually reached on GB10, a precision speedup only where the engine
+    runs native fp8/fp4 matmuls, and a lower utilization for MoE grouped GEMMs.
     """
     band = bandwidth if (bandwidth and bandwidth > 0) else SPARK["bandwidth_gbps"]
     eff = efficiency if (efficiency and efficiency > 0) else BW_EFFICIENCY
-    tf = tflops if (tflops and tflops > 0) else SPARK["fp16_tflops"]
-    mf = mfu if (mfu and mfu > 0) else DEFAULT_MFU
     t = max(int(prompt_tokens), 1)
-    peak = tf * 1e12 * _compute_mult(quant) * mf
-    flops = 2 * spec["active_b"] * 1e9 * t + 2 * spec["layers"] * t * t * spec["hidden"]
-    compute_s = flops / peak
+    flops = prefill_flops(spec, t)
+    compute_s = flops / prefill_peak_flops(spec, quant, tflops, mfu, engine)
     mem_bytes = (weights_gb * GB if (weights_gb and weights_gb > 0)
                  else weight_bytes(spec["total_b"], quant))
     memory_s = mem_bytes / (band * 1e9 * eff)
@@ -361,6 +452,9 @@ def render_prefill(pf: dict) -> None:
 
 def resolve_model(args: argparse.Namespace) -> dict:
     """Resolve a model spec from --model (DB id) or custom --params/... flags."""
+    if args.model and (args.experts or args.top_k):
+        raise SystemExit("--experts/--top-k apply to a custom model (--params ...), "
+                         "not to --model.")
     if args.model and args.model in MODELS:
         spec = dict(MODELS[args.model])
         spec["name"] = args.model
@@ -379,6 +473,16 @@ def resolve_model(args: argparse.Namespace) -> dict:
             "kv_heads": args.kv_heads, "head_dim": args.head_dim,
             "moe": args.active is not None and args.active < args.params,
         }
+        if args.experts or args.top_k:
+            if not (args.experts and args.top_k):
+                raise SystemExit("--experts and --top-k go together.")
+            if not spec["moe"]:
+                raise SystemExit("--experts/--top-k describe a MoE: also pass --active "
+                                 "smaller than --params.")
+            if not args.experts > args.top_k:
+                raise SystemExit("--experts must be greater than --top-k.")
+            spec["n_experts"] = args.experts
+            spec["top_k"] = args.top_k
     return spec
 
 
@@ -387,6 +491,10 @@ def add_model_flags(p: argparse.ArgumentParser) -> None:
     p.add_argument("-m", "--model", help="model id from the built-in DB (see `sparkfit models`)")
     p.add_argument("--params", type=float, help="custom: total params (billions)")
     p.add_argument("--active", type=float, help="custom: active params for MoE (billions)")
+    p.add_argument("--experts", type=_positive_int, default=None,
+                   help="custom MoE: routed experts per layer (for batched decode)")
+    p.add_argument("--top-k", type=_positive_int, default=None,
+                   help="custom MoE: experts each token is routed to")
     p.add_argument("--layers", type=int, default=32, help="custom: number of layers")
     p.add_argument("--hidden", type=int, default=4096, help="custom: hidden size")
     p.add_argument("--kv-heads", type=int, default=8, help="custom: KV heads (GQA)")
@@ -396,10 +504,14 @@ def add_model_flags(p: argparse.ArgumentParser) -> None:
 CONFIG_ENV = "SPARKFIT_CONFIG"
 DEFAULT_CONFIG_PATH = os.path.expanduser("~/.sparkfitrc")
 ENGINE_EFFICIENCY = {"vllm": 0.85, "llama.cpp": 0.55, "ollama": 0.50}
+# Per-step fixed cost by engine. Server-side numbers (vLLM) include scheduling and
+# sampling; llama.cpp figures usually come from llama-bench, which has almost none.
+ENGINE_STEP_OVERHEAD_MS = {"vllm": 4.0, "llama.cpp": 1.0, "ollama": 2.0}
 # friendly config key -> the SPARKFIT_* name the flags already read as defaults.
 _CONFIG_KEYS = {"efficiency": "SPARKFIT_EFFICIENCY", "bandwidth": "SPARKFIT_BANDWIDTH",
                 "os_reserve": "SPARKFIT_OS_RESERVE", "framework": "SPARKFIT_FRAMEWORK",
-                "mfu": "SPARKFIT_MFU", "tflops": "SPARKFIT_TFLOPS"}
+                "mfu": "SPARKFIT_MFU", "tflops": "SPARKFIT_TFLOPS",
+                "step_ms": "SPARKFIT_STEP_MS"}
 
 
 def config_path() -> str:
@@ -484,8 +596,8 @@ def _envf(name: str, default: "float | None") -> "float | None":
 
 
 def add_workload_flags(p: argparse.ArgumentParser) -> None:
-    """Attach the workload/environment flags shared by plan/advise/fit."""
-    p.add_argument("-q", "--quant", default="q4_k_m", help="quantization (default q4_k_m)")
+    """Attach the workload/environment flags shared by plan/advise/fit/serve/cluster."""
+    p.add_argument("-q", "--quant", default="q4_k_m", help="quantization (default q4_k_m; serve and cluster prefer the one detected from the model config)")
     p.add_argument("-c", "--context", type=_positive_int, default=4096, help="context length")
     p.add_argument("-b", "--batch", type=_positive_int, default=1, help="batch size per stream")
     p.add_argument("-n", "--concurrency", type=_positive_int, default=1, help="concurrent streams/replicas")
@@ -498,13 +610,15 @@ def add_workload_flags(p: argparse.ArgumentParser) -> None:
     p.add_argument("--bandwidth", type=float, default=_envf("SPARKFIT_BANDWIDTH", None),
                    help="override memory bandwidth (GB/s)")
     p.add_argument("--efficiency", type=float, default=None,
-                   help="fraction of peak bandwidth reached (calibrate on your device)")
+                   help="fraction of peak bandwidth reached, 0..1 (default 0.70; calibrate with doctor)")
     p.add_argument("--engine", choices=list(ENGINE_EFFICIENCY), default=None,
-                   help="apply a per-engine bandwidth-efficiency preset for this run")
+                   help="apply a per-engine efficiency + step-overhead preset for this run")
+    p.add_argument("--step-overhead-ms", type=float, default=None,
+                   help="fixed ms per decode step (default 4; engine preset with --engine)")
     p.add_argument("--prompt-tokens", type=_positive_int, default=None,
                    help="prompt length for the prefill/TTFT estimate (default: context)")
     p.add_argument("--mfu", type=float, default=_envf("SPARKFIT_MFU", DEFAULT_MFU),
-                   help="model FLOPs utilization for prefill (calibrate on your device)")
+                   help="model FLOPs utilization for prefill, 0..1 (default 0.30)")
     p.add_argument("--compute-tflops", type=float, default=_envf("SPARKFIT_TFLOPS", None),
                    help="override dense FP16 compute in TFLOP/s for prefill")
     p.add_argument("--live", action="store_true",
@@ -546,11 +660,19 @@ def _detect_quant(cfg: dict) -> "str | None":
     if not isinstance(qc, dict):
         return None
     method = str(qc.get("quant_method") or "").lower()
+    # NVIDIA ModelOpt names the algorithm (FP8 / NVFP4 / MXFP4) under quant_algo.
+    algo = str(qc.get("quant_algo") or "").lower()
+    fmt = str(qc.get("format") or "").lower()
     if qc.get("load_in_4bit"):
         return "q4_0"
     if qc.get("load_in_8bit"):
         return "int8"
-    if method == "fp8":
+    # Blackwell-native 4-bit floats: gpt-oss ships MXFP4, ModelOpt/compressed-tensors NVFP4.
+    if method == "mxfp4" or "mxfp4" in algo or "mxfp4" in fmt:
+        return "mxfp4"
+    if method == "nvfp4" or "nvfp4" in algo or "nvfp4" in fmt:
+        return "nvfp4"
+    if method in ("fp8", "fbgemm_fp8") or algo.startswith("fp8"):
         return "fp8"
     bits = qc.get("bits") or qc.get("w_bit") or qc.get("wbits")
     # compressed-tensors nests the width under config_groups[*].weights.num_bits
@@ -559,12 +681,16 @@ def _detect_quant(cfg: dict) -> "str | None":
             w = grp.get("weights") if isinstance(grp, dict) else None
             if isinstance(w, dict) and w.get("num_bits"):
                 bits = w["num_bits"]
-                if str(w.get("type") or "").lower() == "float" and str(bits) == "8":
-                    return "fp8"
+                if str(w.get("type") or "").lower() == "float":
+                    if str(bits) == "8":
+                        return "fp8"
+                    if str(bits) == "4":
+                        return "nvfp4"  # 4-bit float weights: the NVFP4 scheme
                 break
     if bits:
         try:
-            return {8: "int8", 4: "q4_0", 3: "q3_k_m"}.get(int(bits))
+            return {8: "int8", 6: "q6_k", 5: "q5_0", 4: "q4_0", 3: "q3_k_m",
+                    2: "q2_k"}.get(int(bits))
         except (ValueError, TypeError):
             return None
     if method in ("gptq", "awq"):
@@ -675,6 +801,11 @@ def parse_hf_config(cfg: dict) -> dict:
     spec = {"total_b": total / 1e9, "active_b": active / 1e9, "layers": layers,
             "hidden": hidden, "kv_heads": kv_heads, "head_dim": head_dim,
             "kv_layers": kv_layers, "sliding_window": sliding_window, "moe": moe}
+    if moe:
+        spec["n_experts"] = n_exp
+        spec["top_k"] = top
+    if vision:
+        spec["vision_b"] = vision / 1e9
     if kv_style == "mla":
         spec["kv_style"] = "mla"
         spec["mla_dim"] = mla_dim
@@ -785,8 +916,8 @@ def read_live_mem() -> dict:
             out = subprocess.check_output(
                 ["nvidia-smi", "--query-gpu=memory.total,memory.used,memory.free",
                  "--format=csv,noheader,nounits"], text=True, timeout=5)
-            t, u, f = (float(x) for x in out.strip().splitlines()[0].split(","))
-            info["gpu"] = {"total_gb": t / 1024, "used_gb": u / 1024, "free_gb": f / 1024}
+            t, u, f = (float(x) * MIB / GB for x in out.strip().splitlines()[0].split(","))
+            info["gpu"] = {"total_gb": t, "used_gb": u, "free_gb": f}
         except Exception:
             pass
     # Temperature and thermal-throttle status (best effort; field names vary by driver).
@@ -796,18 +927,21 @@ def read_live_mem() -> dict:
                 ["nvidia-smi", "--query-gpu=temperature.gpu",
                  "--format=csv,noheader,nounits"], text=True, timeout=5)
             thermal: dict = {"temp_c": float(out.strip().splitlines()[0])}
-            try:
-                r = subprocess.check_output(
-                    ["nvidia-smi",
-                     "--query-gpu=clocks_throttle_reasons.hw_thermal_slowdown,"
-                     "clocks_throttle_reasons.sw_thermal_slowdown",
-                     "--format=csv,noheader"], text=True, timeout=5)
-                hw, sw = (x.strip().lower() for x in r.strip().splitlines()[0].split(","))
+            # Newer drivers renamed clocks_throttle_reasons.* to clocks_event_reasons.*.
+            for prefix in ("clocks_event_reasons", "clocks_throttle_reasons"):
+                try:
+                    r = subprocess.check_output(
+                        ["nvidia-smi",
+                         f"--query-gpu={prefix}.hw_thermal_slowdown,"
+                         f"{prefix}.sw_thermal_slowdown",
+                         "--format=csv,noheader"], text=True, timeout=5)
+                    hw, sw = (x.strip().lower() for x in r.strip().splitlines()[0].split(","))
+                except Exception:
+                    continue
                 thermal["hw_throttle"] = hw == "active"
                 thermal["sw_throttle"] = sw == "active"
                 thermal["throttling"] = thermal["hw_throttle"] or thermal["sw_throttle"]
-            except Exception:
-                pass
+                break
             info["thermal"] = thermal
         except Exception:
             pass
@@ -817,7 +951,7 @@ def read_live_mem() -> dict:
             mi = {}
             for line in fh:
                 k, _, v = line.partition(":")
-                mi[k] = float(v.strip().split()[0]) / (1024 * 1024)  # kB -> GB
+                mi[k] = float(v.strip().split()[0]) * KIB / GB  # meminfo "kB" is KiB
         info["host"] = {"total_gb": mi.get("MemTotal", 0),
                         "available_gb": mi.get("MemAvailable", 0)}
     except Exception:
@@ -866,17 +1000,21 @@ def cmd_quick(args: argparse.Namespace) -> None:
         # Measured/overridden weights: the model exists at one fixed precision, so
         # exploring other quantizations is not meaningful. Report the single config.
         chosen = args.quant or "on-disk"
-        qz0 = args.quant or "fp16"  # quant is unused for the weight term here
+        # The weight term comes from weights_gb; the quant only sets the prefill
+        # compute speedup, so use the detected one (e.g. fp8) when there is one.
+        qz0 = args.quant or spec.get("detected_quant") or "fp16"
         bd = budget(spec, qz0, ctx, 1, conc, args.kv_dtype, args.os_reserve,
                     args.framework, args.total_mem, weights_gb=weights_gb)
         tp = decode_tok_s(spec, qz0, ctx, conc, args.kv_dtype, args.bandwidth,
-                          args.efficiency, weights_gb=weights_gb)
+                          args.efficiency, overhead_ms=args.step_overhead_ms,
+                          weights_gb=weights_gb)
+        compute_quant = qz0
     else:
         auto = first_fit = None
         for qz in QUANT_LADDER:
             b = budget(spec, qz, ctx, 1, conc, args.kv_dtype, args.os_reserve,
                        args.framework, args.total_mem)
-            t = decode_tok_s(spec, qz, ctx, conc, args.kv_dtype, args.bandwidth, args.efficiency)
+            t = decode_tok_s(spec, qz, ctx, conc, args.kv_dtype, args.bandwidth, args.efficiency, overhead_ms=args.step_overhead_ms)
             ladder.append((qz, b, t))
             if b["fits"]:
                 if first_fit is None:
@@ -887,11 +1025,12 @@ def cmd_quick(args: argparse.Namespace) -> None:
                   or auto or first_fit or QUANT_LADDER[-1])
         bd = budget(spec, chosen, ctx, 1, conc, args.kv_dtype, args.os_reserve,
                     args.framework, args.total_mem)
-        tp = decode_tok_s(spec, chosen, ctx, conc, args.kv_dtype, args.bandwidth, args.efficiency)
+        tp = decode_tok_s(spec, chosen, ctx, conc, args.kv_dtype, args.bandwidth, args.efficiency, overhead_ms=args.step_overhead_ms)
+        compute_quant = chosen
 
-    pf = prefill_stats(spec, chosen, args.prompt_tokens or ctx, args.bandwidth,
+    pf = prefill_stats(spec, compute_quant, args.prompt_tokens or ctx, args.bandwidth,
                        args.efficiency, args.compute_tflops, args.mfu,
-                       weights_gb=weights_gb)
+                       weights_gb=weights_gb, engine=args.engine)
 
     if args.json:
         print(json.dumps({
@@ -916,7 +1055,7 @@ def cmd_quick(args: argparse.Namespace) -> None:
     elif args.quant is not None:
         pick = "chosen"
     elif spec.get("detected_quant") and chosen == spec.get("detected_quant"):
-        pick = "detected"
+        pick = "native" if spec.get("source") in (None, "builtin") else "detected"
     else:
         pick = "auto"
     streams_suffix = f"  |  {conc} streams" if conc > 1 else ""
@@ -975,11 +1114,11 @@ def cmd_plan(args: argparse.Namespace) -> None:
                 args.kv_dtype, args.os_reserve, args.framework, args.total_mem,
                 weights_gb=args.weights_gb)
     tp = decode_tok_s(spec, args.quant, args.context, args.batch * args.concurrency,
-                      args.kv_dtype, args.bandwidth, args.efficiency,
+                      args.kv_dtype, args.bandwidth, args.efficiency, overhead_ms=args.step_overhead_ms,
                       weights_gb=args.weights_gb)
     pf = prefill_stats(spec, args.quant, args.prompt_tokens or args.context,
                        args.bandwidth, args.efficiency, args.compute_tflops, args.mfu,
-                       weights_gb=args.weights_gb)
+                       weights_gb=args.weights_gb, engine=args.engine)
 
     if args.json:
         print(json.dumps({"model": spec, "quant": args.quant, "context": args.context,
@@ -1027,7 +1166,7 @@ def cmd_advise(args: argparse.Namespace) -> None:
         bd = budget(spec, q, args.context, args.batch, args.concurrency,
                     args.kv_dtype, args.os_reserve, args.framework, args.total_mem)
         tp = decode_tok_s(spec, q, args.context, args.batch * args.concurrency,
-                          args.kv_dtype, args.bandwidth, args.efficiency)
+                          args.kv_dtype, args.bandwidth, args.efficiency, overhead_ms=args.step_overhead_ms)
         margin = bd["free"] / bd["total"]
         results.append((q, bd, tp, margin))
 
@@ -1082,19 +1221,20 @@ def cmd_fit(args: argparse.Namespace) -> None:
         spec = resolve_model(args)
         rows = []
         n = 1
-        while n <= 256:
+        while n <= MAX_CONCURRENCY_SCAN:
             bd = budget(spec, args.quant, args.context, args.batch, n,
                         args.kv_dtype, args.os_reserve, args.framework, args.total_mem)
             if not bd["fits"]:
                 break
             tp = decode_tok_s(spec, args.quant, args.context, args.batch * n,
-                              args.kv_dtype, args.bandwidth, args.efficiency)
+                              args.kv_dtype, args.bandwidth, args.efficiency, overhead_ms=args.step_overhead_ms)
             rows.append((n, bd, tp))
             n += 1
         max_n = rows[-1][0] if rows else 0
+        capped = max_n == MAX_CONCURRENCY_SCAN  # still fits at the scan limit
         if args.json:
             print(json.dumps({"model": spec["name"], "quant": args.quant,
-                              "max_concurrency": max_n}, indent=2))
+                              "max_concurrency": max_n, "capped": capped}, indent=2))
             return
         print()
         print(bold(f"  Max concurrency | {spec['name']} | {args.quant} | ctx {args.context}"))
@@ -1103,8 +1243,11 @@ def cmd_fit(args: argparse.Namespace) -> None:
             print("  " + red("> does not fit even at 1 stream; reduce -c/-q "
                               "or pick a smaller model"))
         else:
-            print("  " + green(f"> up to {max_n} concurrent stream(s) fit in "
+            more = "+" if capped else ""
+            print("  " + green(f"> up to {max_n}{more} concurrent stream(s) fit in "
                                f"{(args.total_mem or SPARK['total_mem_gb']):.0f} GB"))
+            if capped:
+                print(dim(f"    (scan stops at {MAX_CONCURRENCY_SCAN} streams; more may fit)"))
         if rows:
             last = rows[-1]
             print(dim(f"    at {max_n} streams: {fmt_gb(last[1]['used']).strip()} used | "
@@ -1121,7 +1264,7 @@ def cmd_fit(args: argparse.Namespace) -> None:
         bd = budget(spec, args.quant, args.context, args.batch, args.concurrency,
                     args.kv_dtype, args.os_reserve, args.framework, args.total_mem)
         tp = decode_tok_s(spec, args.quant, args.context, args.batch * args.concurrency,
-                          args.kv_dtype, args.bandwidth, args.efficiency)
+                          args.kv_dtype, args.bandwidth, args.efficiency, overhead_ms=args.step_overhead_ms)
         fitting.append((name, base["total_b"], bd, tp))
     fitting.sort(key=lambda r: r[1], reverse=True)
 
@@ -1148,6 +1291,31 @@ def cmd_fit(args: argparse.Namespace) -> None:
     print()
 
 
+def split_serve_token(token: str) -> "tuple[str, str | None, str | None]":
+    """Split a `serve` spec NAME[:quant[:context]] into (name, quant, context).
+
+    The model part may itself contain ':' (a URL, or a Windows path such as
+    C:\\models\\x), so suffixes are peeled from the right and never past a drive
+    letter, an existing path, or a piece containing a path separator (the
+    '//host/...' of a URL), so https://huggingface.co/org/m:fp8 also works.
+    """
+    if os.path.exists(token):
+        return token, None, None
+    head = token
+    suffixes: list = []
+    for _ in range(2):
+        if os.path.exists(head):
+            break
+        base, sep, tail = head.rpartition(":")
+        if not sep or re.fullmatch(r"[A-Za-z]", base) or "/" in tail or "\\" in tail:
+            break
+        suffixes.insert(0, tail)
+        head = base
+    quant = suffixes[0] if suffixes and suffixes[0] else None
+    ctx = suffixes[1] if len(suffixes) > 1 and suffixes[1] else None
+    return head, quant, ctx
+
+
 def cmd_serve(args: argparse.Namespace) -> None:
     """Plan several models co-served on one Spark: shared memory and shared bandwidth.
 
@@ -1160,34 +1328,35 @@ def cmd_serve(args: argparse.Namespace) -> None:
     total = (args.total_mem if args.total_mem is not None else SPARK["total_mem_gb"]) * GB
     if total <= 0:
         raise SystemExit("--total-mem must be a positive number of GB.")
+    streams = args.batch * args.concurrency  # per model
     rows = []
     for token in args.models:
-        if "://" in token:  # a full URL: no quant/context suffix to split off
-            parts = [token]
-        else:
-            parts = token.split(":")
-        name = parts[0]
-        q = parts[1] if len(parts) > 1 and parts[1] else None
-        if len(parts) > 2 and parts[2]:
+        name, q, ctx_raw = split_serve_token(token)
+        if ctx_raw:
             try:
-                ctx = int(parts[2])
+                ctx = int(ctx_raw)
             except ValueError:
-                raise SystemExit(f"Bad context in '{token}': '{parts[2]}' is not an integer.")
+                raise SystemExit(f"Bad context in '{token}': '{ctx_raw}' is not an integer.")
         else:
             ctx = args.context
         if ctx < 1:
             raise SystemExit(f"Context must be >= 1 (in '{token}').")
         spec = resolve_target(name)
-        quant = q or spec.get("detected_quant") or args.quant
+        # per-model suffix > explicit -q > quant declared by the model's config > default
+        quant = q or args.quant or spec.get("detected_quant") or DEFAULT_QUANT
         wgb = spec.get("weights_gb")
         w = wgb * GB if wgb else weight_bytes(spec["total_b"], quant)
-        kv = kv_total_bytes(spec, ctx, 1, args.kv_dtype)
-        act = activation_bytes(spec, ctx, 1)
-        alone = decode_tok_s(spec, quant, ctx, 1, args.kv_dtype, args.bandwidth,
-                             args.efficiency, weights_gb=wgb)["per_stream"]
+        kv = kv_total_bytes(spec, ctx, streams, args.kv_dtype)
+        act = activation_bytes(spec, ctx, streams)
+        alone = decode_tok_s(spec, quant, ctx, streams, args.kv_dtype, args.bandwidth,
+                             args.efficiency, overhead_ms=args.step_overhead_ms,
+                             weights_gb=wgb)["per_stream"]
+        pf = prefill_stats(spec, quant, args.prompt_tokens or ctx, args.bandwidth,
+                           args.efficiency, args.compute_tflops, args.mfu, weights_gb=wgb,
+                           engine=args.engine)
         rows.append({"name": spec["name"], "quant": quant, "context": ctx,
                      "weights": w, "kv": kv, "act": act, "total": w + kv + act,
-                     "alone": alone})
+                     "alone": alone, "ttft": pf["ttft_s"]})
     n = len(rows)
     for r in rows:
         r["contended"] = r["alone"] / n  # worst case: N models decoding at once
@@ -1203,8 +1372,9 @@ def cmd_serve(args: argparse.Namespace) -> None:
                         "kv_gb": round(r["kv"] / GB, 2),
                         "total_gb": round(r["total"] / GB, 2),
                         "tok_s_alone": round(r["alone"], 1),
-                        "tok_s_contended": round(r["contended"], 1)} for r in rows],
-            "active_models": n,
+                        "tok_s_contended": round(r["contended"], 1),
+                        "prefill_ttft_s": round(r["ttft"], 2)} for r in rows],
+            "active_models": n, "streams_per_model": streams,
             "memory_gb": {"used": round(used / GB, 2), "total": round(total / GB, 2),
                           "overhead": round(overhead / GB, 2),
                           "headroom": round((total - used) / GB, 2)},
@@ -1212,7 +1382,9 @@ def cmd_serve(args: argparse.Namespace) -> None:
         return
 
     print()
-    print(bold(f"  Co-serving on {SPARK['name']}  |  {n} models  |  {total / GB:.0f} GB unified"))
+    per_model = f"  |  {streams} streams each" if streams > 1 else ""
+    print(bold(f"  Co-serving on {SPARK['name']}  |  {n} models  |  {total / GB:.0f} GB unified"
+               f"{per_model}"))
     print()
     print(dim(f"  {'model':<20}{'quant':>8}{'ctx':>8}{'weights':>10}{'KV':>8}"
               f"{'total':>9}{'alone':>8}{'shared':>8}"))
@@ -1248,10 +1420,12 @@ def cmd_cluster(args: argparse.Namespace) -> None:
     per-node scaling factor (default 0.5 added per extra node) is calibratable.
     """
     apply_live(args)  # --live plans each node against its currently-free memory
-    if args.scaling < 0:
-        raise SystemExit("--scaling must be >= 0.")
+    if not 0 <= args.scaling <= 1:
+        raise SystemExit("--scaling must be between 0 and 1.")
+    if args.fabric_gbps <= 0:
+        raise SystemExit("--fabric-gbps must be a positive number of Gb/s.")
     spec = resolve_target(args.model)
-    quant = args.quant
+    quant = args.quant or spec.get("detected_quant") or DEFAULT_QUANT
     weights_gb = args.weights_gb if args.weights_gb is not None else spec.get("weights_gb")
     n = args.nodes
     node_total = (args.total_mem if args.total_mem is not None else SPARK["total_mem_gb"]) * GB
@@ -1269,8 +1443,12 @@ def cmd_cluster(args: argparse.Namespace) -> None:
     fits = per_node_used <= node_total
 
     one = decode_tok_s(spec, quant, args.context, streams, args.kv_dtype,
-                       args.bandwidth, args.efficiency, weights_gb=weights_gb)
-    mult = 1 + (n - 1) * args.scaling * (args.fabric_gbps / 200.0)  # slower fabric -> less gain
+                       args.bandwidth, args.efficiency, overhead_ms=args.step_overhead_ms,
+                       weights_gb=weights_gb)
+    # A slower fabric lowers the gain; a faster one cannot push past the per-node
+    # scaling factor, so N nodes never exceed N x one node.
+    fabric_factor = min(args.fabric_gbps / REFERENCE_FABRIC_GBPS, 1.0)
+    mult = 1 + (n - 1) * args.scaling * fabric_factor
     if args.parallelism == "tp":
         per_stream = one["per_stream"] * mult      # tensor parallel speeds up one stream
         aggregate = per_stream * streams
@@ -1340,7 +1518,106 @@ def _effective_settings() -> dict:
             "os_reserve": _envf("SPARKFIT_OS_RESERVE", DEFAULT_OS_RESERVE_GB),
             "framework": _envf("SPARKFIT_FRAMEWORK", DEFAULT_FRAMEWORK_GB),
             "mfu": _envf("SPARKFIT_MFU", DEFAULT_MFU),
-            "tflops": _envf("SPARKFIT_TFLOPS", SPARK["fp16_tflops"])}
+            "tflops": _envf("SPARKFIT_TFLOPS", SPARK["fp16_tflops"]),
+            "step_ms": _envf("SPARKFIT_STEP_MS", DEFAULT_STEP_OVERHEAD_MS)}
+
+
+def _doctor_calibrate(args: argparse.Namespace, band: float) -> None:
+    """`doctor --measured-tok-s` and/or `--measured-ttft`: back out efficiency / MFU."""
+    tok_s, ttft = args.measured_tok_s, args.measured_ttft
+    if tok_s is not None and tok_s <= 0:
+        raise SystemExit("--measured-tok-s must be positive.")
+    if ttft is not None and ttft <= 0:
+        raise SystemExit("--measured-ttft must be a positive number of seconds.")
+    spec = resolve_target(args.model) if args.model else None
+    if ttft is not None and spec is None:
+        raise SystemExit("doctor --measured-ttft needs --model (its FLOPs depend on the "
+                         "architecture).")
+    wgb = args.weights_gb
+    if spec is not None and wgb is None:
+        wgb = spec.get("weights_gb")
+    quant = args.quant or (spec or {}).get("detected_quant") or DEFAULT_QUANT
+    out: dict = {}
+    updates: dict = {}
+    lines: list = []
+
+    eff = None
+    if tok_s is not None:
+        if spec is not None:
+            bytes_step = (streamed_weight_bytes(spec, quant, 1, wgb)
+                          + kv_per_token_bytes(spec, args.kv_dtype) * effective_context(spec, args.context))
+        elif wgb:
+            bytes_step = wgb * GB
+        else:
+            raise SystemExit("doctor --measured-tok-s needs --model or --weights-gb.")
+        # The measured step = bytes / (bandwidth * eff) + fixed overhead.
+        overhead_s = (args.step_overhead_ms or 0.0) / 1000.0
+        stream_s = 1.0 / tok_s - overhead_s
+        if stream_s <= 0:
+            raise SystemExit(
+                f"{tok_s:.1f} tok/s is faster than the {overhead_s * 1000:.1f} ms fixed step "
+                "overhead allows; lower --step-overhead-ms.")
+        eff = bytes_step / (band * 1e9 * stream_s)
+        updates["efficiency"] = round(min(eff, 1.0), 3)  # never persist an efficiency > 1.0
+        # The efficiency only reproduces the measurement with the overhead it was
+        # backed out with, so persist the two together.
+        updates["step_ms"] = args.step_overhead_ms
+        out.update({"calibrated_efficiency": round(eff, 3), "measured_tok_s": tok_s,
+                    "step_overhead_ms": args.step_overhead_ms})
+        lines.append(f"  measured {tok_s:.1f} tok/s on ~{bytes_step / GB:.1f} GB per step "
+                     f"at {band:.0f} GB/s (+{overhead_s * 1000:.1f} ms fixed per step)")
+        lines.append("  -> bandwidth efficiency " + bold(f"{eff:.2f}")
+                     + dim(f"  (default is {BW_EFFICIENCY:.2f})"))
+        if eff > 1.0:
+            lines.append(yellow("  note: efficiency > 1.0 means the measurement beats the "
+                                "roofline; check the weight size and bandwidth."))
+
+    if ttft is not None and spec is not None:
+        prompt = args.prompt_tokens or args.context
+        flops = prefill_flops(spec, prompt)
+        ceiling = prefill_peak_flops(spec, quant, args.compute_tflops, None, args.engine,
+                                     apply_mfu=False)
+        bw_eff = eff if (eff and eff <= 1.0) else _envf("SPARKFIT_EFFICIENCY", BW_EFFICIENCY)
+        mem_bytes = wgb * GB if (wgb and wgb > 0) else weight_bytes(spec["total_b"], quant)
+        memory_s = mem_bytes / (band * 1e9 * (bw_eff or BW_EFFICIENCY))
+        mfu = flops / (ttft * ceiling)
+        out.update({"measured_ttft_s": ttft, "prompt_tokens": prompt,
+                    "calibrated_mfu": round(mfu, 3), "memory_floor_s": round(memory_s, 3)})
+        lines.append(f"  measured {ttft:.2f} s to first token for a {prompt} token prompt "
+                     f"({flops / 1e12:.1f} TFLOP at {quant}"
+                     + (f", {args.engine}" if args.engine else "") + ")")
+        if ttft <= memory_s * 1.1:
+            out["mfu_saved"] = False
+            lines.append(yellow(f"  note: {ttft:.2f} s is at the bandwidth floor (~{memory_s:.2f} s "
+                                "to read the weights), so it says little about compute; "
+                                "measure with a longer prompt. MFU not saved."))
+        elif mfu > 1.0:
+            out["mfu_saved"] = False
+            lines.append(yellow(f"  note: MFU {mfu:.2f} > 1.0 beats the compute ceiling; check "
+                                "--engine, --quant and the prompt length. MFU not saved."))
+        else:
+            updates["mfu"] = round(mfu, 3)
+            out["mfu_saved"] = True
+            lines.append("  -> prefill MFU " + bold(f"{mfu:.2f}")
+                         + dim(f"  (default is {DEFAULT_MFU:.2f})"))
+
+    saved = write_config(updates) if (args.save and updates) else None
+    if args.json:
+        out.update({"bandwidth_gbps": band, "saved_to": saved})
+        print(json.dumps(out, indent=2))
+        return
+    print()
+    print(bold("  sparkfit doctor  |  calibration"))
+    print()
+    for line in lines:
+        print(line)
+    print()
+    if saved:
+        print("  " + green(f"saved to {saved}"))
+    elif updates:
+        env = "  ".join(f"SPARKFIT_{k.upper()}={v}" for k, v in updates.items())
+        print(dim(f"  re-run with --save to write this to the config file, or set {env}"))
+    print()
 
 
 def cmd_doctor(args: argparse.Namespace) -> None:
@@ -1348,61 +1625,32 @@ def cmd_doctor(args: argparse.Namespace) -> None:
 
     With a measured single-stream decode tok/s, back out the real bandwidth
     efficiency (decode is memory-bound, so eff = tok_s * bytes_per_step / bandwidth).
-    With --engine, start from a sensible per-engine efficiency. Otherwise, report the
-    device and the settings currently in effect.
+    With a measured time-to-first-token, back out the prefill MFU
+    (mfu = prefill_flops / (ttft * compute_ceiling)). With --engine alone, start from
+    a sensible per-engine efficiency. Otherwise, report the device and the settings
+    currently in effect.
     """
     band = args.bandwidth if (args.bandwidth and args.bandwidth > 0) else SPARK["bandwidth_gbps"]
 
-    if args.measured_tok_s is not None:
-        if args.measured_tok_s <= 0:
-            raise SystemExit("--measured-tok-s must be positive.")
-        if args.model:
-            spec = resolve_target(args.model)
-            wgb = args.weights_gb if args.weights_gb is not None else spec.get("weights_gb")
-            active = wgb * GB if (wgb and wgb > 0) else weight_bytes(spec["active_b"], args.quant)
-            bytes_step = active + kv_per_token_bytes(spec, args.kv_dtype) * effective_context(spec, args.context)
-        elif args.weights_gb:
-            bytes_step = args.weights_gb * GB
-        else:
-            raise SystemExit("doctor --measured-tok-s needs --model or --weights-gb.")
-        eff = args.measured_tok_s * bytes_step / (band * 1e9)
-        save_eff = round(min(eff, 1.0), 3)  # never persist an efficiency above 1.0
-        saved = write_config({"efficiency": save_eff}) if args.save else None
-        if args.json:
-            print(json.dumps({"calibrated_efficiency": round(eff, 3),
-                              "measured_tok_s": args.measured_tok_s,
-                              "bandwidth_gbps": band, "saved_to": saved}, indent=2))
-            return
-        print()
-        print(bold("  sparkfit doctor  |  calibration"))
-        print()
-        print(f"  measured {args.measured_tok_s:.1f} tok/s on ~{bytes_step / GB:.1f} GB per step "
-              f"at {band:.0f} GB/s")
-        print("  -> bandwidth efficiency " + bold(f"{eff:.2f}")
-              + dim(f"  (default is {BW_EFFICIENCY:.2f})"))
-        if eff > 1.0:
-            print(yellow("  note: efficiency > 1.0 means the measurement beats the roofline; "
-                         "check the weight size and bandwidth."))
-        print()
-        if saved:
-            print("  " + green(f"saved to {saved}"))
-        else:
-            print(dim("  re-run with --save to write this to the config file, or set "
-                      f"SPARKFIT_EFFICIENCY={eff:.2f}"))
-        print()
+    if args.measured_tok_s is not None or args.measured_ttft is not None:
+        _doctor_calibrate(args, band)
         return
 
     if args.engine:
         eff = ENGINE_EFFICIENCY[args.engine]
-        saved = write_config({"efficiency": eff}) if args.save else None
+        step_ms = (args.step_overhead_ms if args.step_overhead_explicit
+                   else ENGINE_STEP_OVERHEAD_MS[args.engine])
+        saved =(write_config({"efficiency": eff, "step_ms": step_ms})
+                 if args.save else None)
         if args.json:
             print(json.dumps({"engine": args.engine, "efficiency": eff,
-                              "saved_to": saved}, indent=2))
+                              "step_overhead_ms": step_ms, "saved_to": saved}, indent=2))
             return
         print()
         print(bold("  sparkfit doctor  |  engine preset"))
         print()
-        print(f"  {args.engine}: starting bandwidth efficiency " + bold(f"{eff:.2f}"))
+        print(f"  {args.engine}: starting bandwidth efficiency " + bold(f"{eff:.2f}")
+              + f", fixed step overhead {bold(f'{step_ms:.1f} ms')}")
         print(dim("  (vLLM captures CUDA graphs and uses FP4 GEMM; llama.cpp/ollama "
                   "dequantize GGUF, so they reach less of peak bandwidth)"))
         print()
@@ -1413,9 +1661,11 @@ def cmd_doctor(args: argparse.Namespace) -> None:
 
     # default: report device + effective settings + how to calibrate
     info = read_live_mem()
-    eff = _effective_settings()
+    settings = _effective_settings()
+    settings["bandwidth"] = band                      # a --bandwidth flag wins
+    settings["step_ms"] = args.step_overhead_ms       # flag > env > config > default
     if args.json:
-        print(json.dumps({"device": info, "settings": eff,
+        print(json.dumps({"device": info, "settings": settings,
                           "config_path": config_path(),
                           "config_exists": os.path.isfile(config_path())}, indent=2))
         return
@@ -1429,11 +1679,13 @@ def cmd_doctor(args: argparse.Namespace) -> None:
         print(dim("  device: no nvidia-smi / /proc/meminfo (not a Spark, or run it on the box)"))
     print()
     print(dim("  effective settings (flag > env > config > default):"))
-    print(f"    efficiency   {eff['efficiency']:.2f}")
-    print(f"    bandwidth    {eff['bandwidth']:.0f} GB/s")
-    print(f"    os reserve   {eff['os_reserve']:.0f} GB")
-    print(f"    framework    {eff['framework']:.0f} GB")
-    print(f"    mfu          {eff['mfu']:.2f}")
+    print(f"    efficiency   {settings['efficiency']:.2f}")
+    print(f"    bandwidth    {settings['bandwidth']:.0f} GB/s")
+    print(f"    os reserve   {settings['os_reserve']:.0f} GB")
+    print(f"    framework    {settings['framework']:.0f} GB")
+    print(f"    mfu          {settings['mfu']:.2f}")
+    print(f"    tflops       {settings['tflops']:.0f} (dense BF16)")
+    print(f"    step         {settings['step_ms']:.1f} ms fixed per decode step")
     print()
     cp = config_path()
     print(dim(f"  config: {cp} ({'loaded' if os.path.isfile(cp) else 'not found'})"))
@@ -1523,7 +1775,11 @@ def build_parser() -> argparse.ArgumentParser:
                "  sparkfit advise -m qwen2.5-72b -c 16384\n"
                "  sparkfit fit -q q4_k_m -c 4096\n"
                "  sparkfit fit -m llama3.1-8b --concurrency-scan\n"
-               "  sparkfit scan",
+               "  sparkfit serve qwen2.5-7b:fp8:8192 llama3.2-3b:fp8:2048\n"
+               "  sparkfit cluster deepseek-r1 -N 4 -q q4_k_m\n"
+               "  sparkfit doctor --measured-tok-s 6.8 --weights-gb 35.9 --save\n"
+               "  sparkfit scan\n"
+               "  sparkfit llama3.1-70b     (bare model: one-shot quick report)",
         formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--version", "-V", action="version",
                    version="sparkfit " + __version__)
@@ -1551,9 +1807,12 @@ def build_parser() -> argparse.ArgumentParser:
     sv = sub.add_parser("serve",
                         help="plan several models co-served on one Spark (shared memory + bandwidth)")
     sv.add_argument("models", nargs="+",
-                    help="model specs NAME[:quant[:context]] (e.g. deepseek-r1:fp8:8192)")
+                    help="model specs NAME[:quant[:context]]; NAME is a catalog id, "
+                         "Hugging Face id or local path (e.g. deepseek-r1:fp8:8192)")
     add_workload_flags(sv)
-    sv.set_defaults(func=cmd_serve)
+    # No fixed quant default: an explicit -q wins over the detected one, which wins
+    # over q4_k_m (as in cluster).
+    sv.set_defaults(func=cmd_serve, quant=None)
 
     cl = sub.add_parser("cluster",
                         help="plan one model across several Spark nodes (combined memory + fabric)")
@@ -1562,26 +1821,39 @@ def build_parser() -> argparse.ArgumentParser:
     cl.add_argument("--parallelism", choices=["pp", "tp"], default="pp",
                     help="pipeline (default, capacity+throughput) or tensor (single-stream latency)")
     cl.add_argument("--fabric-gbps", type=float, default=200.0,
-                    help="inter-node fabric bandwidth in Gb/s (default 200)")
+                    help="inter-node fabric bandwidth in Gb/s (default 200); slower "
+                         "lowers the speedup, faster does not raise it")
     cl.add_argument("--scaling", type=float, default=0.5,
                     help="aggregate throughput added per extra node, 0..1 (default 0.5)")
     cl.add_argument("--weights-gb", type=float, default=None,
                     help="override weight footprint in GB")
     add_workload_flags(cl)
-    cl.set_defaults(func=cmd_cluster)
+    # No fixed quant default: use the one detected from the model's config, if any.
+    cl.set_defaults(func=cmd_cluster, quant=None)
 
     dr = sub.add_parser("doctor",
                         help="calibrate sparkfit to your device and save the settings")
     dr.add_argument("--measured-tok-s", type=float,
                     help="a measured single-stream decode tok/s to calibrate efficiency")
+    dr.add_argument("--measured-ttft", type=float,
+                    help="a measured time-to-first-token in seconds to calibrate the "
+                         "prefill MFU (needs --model; use a long prompt)")
+    dr.add_argument("--prompt-tokens", type=_positive_int, default=None,
+                    help="prompt length of the TTFT measurement (default: --context)")
+    dr.add_argument("--compute-tflops", type=float, default=_envf("SPARKFIT_TFLOPS", None),
+                    help="override dense BF16 compute in TFLOP/s")
     dr.add_argument("-m", "--model", help="model for the measured point (id / HF / local path)")
     dr.add_argument("--weights-gb", type=float, help="weight size in GB (if not using --model)")
-    dr.add_argument("-q", "--quant", default="q4_k_m")
+    dr.add_argument("-q", "--quant", default=None,
+                    help=f"quant of the measured model (default: detected, else {DEFAULT_QUANT})")
     dr.add_argument("-c", "--context", type=_positive_int, default=4096)
     dr.add_argument("--kv-dtype", default="fp16", choices=list(KV_BYTES))
     dr.add_argument("--bandwidth", type=float, default=_envf("SPARKFIT_BANDWIDTH", None))
     dr.add_argument("--engine", choices=list(ENGINE_EFFICIENCY),
-                    help="start from a per-engine efficiency default")
+                    help="alone: start from a per-engine efficiency default; with "
+                         "--measured-ttft: the engine that was measured")
+    dr.add_argument("--step-overhead-ms", type=float, default=None,
+                    help="fixed ms per decode step (default 4; engine preset with --engine)")
     dr.add_argument("--save", action="store_true",
                     help="write the value to the config file (~/.sparkfitrc)")
     dr.add_argument("--json", action="store_true")
@@ -1607,6 +1879,8 @@ def build_parser() -> argparse.ArgumentParser:
     qk.add_argument("--bandwidth", type=float, default=_envf("SPARKFIT_BANDWIDTH", None))
     qk.add_argument("--efficiency", type=float, default=None)
     qk.add_argument("--engine", choices=list(ENGINE_EFFICIENCY), default=None)
+    qk.add_argument("--step-overhead-ms", type=float, default=None,
+                    help="fixed ms per decode step (default 4; engine preset with --engine)")
     qk.add_argument("--prompt-tokens", type=_positive_int, default=None)
     qk.add_argument("--mfu", type=float, default=_envf("SPARKFIT_MFU", DEFAULT_MFU))
     qk.add_argument("--compute-tflops", type=float, default=_envf("SPARKFIT_TFLOPS", None))
@@ -1620,8 +1894,91 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _ensure_utf8_output() -> None:
+    """Make stdout/stderr able to print the report's box-drawing glyphs.
+
+    On Windows a redirected or piped stream uses the ANSI code page (cp1252), which
+    cannot encode characters like the bars and check marks, so printing would crash.
+    Switch such streams to UTF-8 (and never fail on an unencodable character).
+    """
+    for stream in (sys.stdout, sys.stderr):
+        enc = (getattr(stream, "encoding", None) or "").lower().replace("-", "")
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None or enc in ("utf8", "utf8sig"):
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (ValueError, OSError):
+            pass
+
+
+def _check_range(args: argparse.Namespace, attr: str, flag: str, *, low: float = 0.0,
+                 high: "float | None" = None, inclusive_low: bool = False) -> None:
+    """Reject an out-of-range numeric option with a clear message (None = not set)."""
+    val = getattr(args, attr, None)
+    if val is None:
+        return
+    too_low = val < low if inclusive_low else val <= low
+    if too_low or (high is not None and val > high):
+        rng = (f"{'>=' if inclusive_low else '>'} {low:g}"
+               + (f" and <= {high:g}" if high is not None else ""))
+        raise SystemExit(f"{flag} must be {rng}, got {val:g}.")
+
+
+def resolve_engine_defaults(args: argparse.Namespace) -> None:
+    """Fill --efficiency / --step-overhead-ms left unset on the command line.
+
+    Precedence: explicit flag > SPARKFIT_* variable > config file (e.g. a value
+    calibrated by `doctor`) > --engine preset > built-in default. A calibration of
+    your own device is more specific than a generic engine preset, so --engine never
+    replaces it. `step_overhead_explicit` records whether the flag was given.
+    """
+    eng = getattr(args, "engine", None)
+    if hasattr(args, "efficiency") and args.efficiency is None:
+        args.efficiency = _envf("SPARKFIT_EFFICIENCY", None)
+        if args.efficiency is None:
+            args.efficiency = ENGINE_EFFICIENCY[eng] if eng else BW_EFFICIENCY
+    if hasattr(args, "step_overhead_ms"):
+        args.step_overhead_explicit = args.step_overhead_ms is not None
+        if args.step_overhead_ms is None:
+            args.step_overhead_ms = _envf("SPARKFIT_STEP_MS", None)
+        if args.step_overhead_ms is None:
+            args.step_overhead_ms = (ENGINE_STEP_OVERHEAD_MS[eng] if eng
+                                     else DEFAULT_STEP_OVERHEAD_MS)
+
+
+def validate_args(args: argparse.Namespace) -> None:
+    """Validate the numeric knobs shared by the subcommands (after defaults resolve)."""
+    _check_range(args, "efficiency", "--efficiency (or SPARKFIT_EFFICIENCY)", high=1.0)
+    _check_range(args, "mfu", "--mfu (or SPARKFIT_MFU)", high=1.0)
+    _check_range(args, "os_reserve", "--os-reserve", inclusive_low=True)
+    _check_range(args, "framework", "--framework", inclusive_low=True)
+    _check_range(args, "total_mem", "--total-mem")
+    _check_range(args, "bandwidth", "--bandwidth")
+    _check_range(args, "compute_tflops", "--compute-tflops")
+    _check_range(args, "weights_gb", "--weights-gb")
+    _check_range(args, "step_overhead_ms", "--step-overhead-ms (or SPARKFIT_STEP_MS)",
+                 inclusive_low=True)
+    _check_range(args, "fabric_gbps", "--fabric-gbps")
+    _check_range(args, "scaling", "--scaling", high=1.0, inclusive_low=True)
+    # Subcommands without these flags (doctor) still read them from the environment
+    # or the config file, so check those values too.
+    env_only = argparse.Namespace(
+        efficiency=_envf("SPARKFIT_EFFICIENCY", None), mfu=_envf("SPARKFIT_MFU", None),
+        step_overhead_ms=_envf("SPARKFIT_STEP_MS", None))
+    if not hasattr(args, "efficiency"):
+        _check_range(env_only, "efficiency", "SPARKFIT_EFFICIENCY", high=1.0)
+    if not hasattr(args, "mfu"):
+        _check_range(env_only, "mfu", "SPARKFIT_MFU", high=1.0)
+    if not hasattr(args, "step_overhead_ms"):
+        _check_range(env_only, "step_overhead_ms", "SPARKFIT_STEP_MS", inclusive_low=True)
+
+
 def main(argv: list[str] | None = None) -> None:
     """Entry point. Routes a bare model argument to the quick subcommand."""
+    global _CONFIG
+    _ensure_utf8_output()
+    _CONFIG = load_config_file()  # re-read so $SPARKFIT_CONFIG set at runtime applies
     argv = list(sys.argv[1:] if argv is None else argv)
     known = {"plan", "advise", "fit", "serve", "cluster", "doctor", "scan", "models",
              "quick", "-h", "--help", "--version", "-V"}
@@ -1631,9 +1988,8 @@ def main(argv: list[str] | None = None) -> None:
     if argv[0] not in known:
         argv = ["quick"] + argv
     args = build_parser().parse_args(argv)
-    if hasattr(args, "efficiency") and args.efficiency is None:
-        eng = getattr(args, "engine", None)
-        args.efficiency = ENGINE_EFFICIENCY[eng] if eng else _envf("SPARKFIT_EFFICIENCY", BW_EFFICIENCY)
+    resolve_engine_defaults(args)
+    validate_args(args)
     args.func(args)
 
 

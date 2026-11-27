@@ -1,14 +1,15 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/logo-dark.svg">
-    <img alt="sparkfit" src="assets/logo.svg" width="360">
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/engineering87/sparkfit/main/assets/logo-dark.svg">
+    <img alt="sparkfit" src="https://raw.githubusercontent.com/engineering87/sparkfit/main/assets/logo.svg" width="360">
   </picture>
 </p>
 
 <p align="center">
   <a href="https://github.com/engineering87/sparkfit/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/engineering87/sparkfit/ci.yml?branch=main&style=flat-square&logo=githubactions&logoColor=white&label=CI"></a>
+  <a href="https://github.com/engineering87/sparkfit/actions/workflows/codeql.yml"><img alt="CodeQL" src="https://img.shields.io/github/actions/workflow/status/engineering87/sparkfit/codeql.yml?branch=main&style=flat-square&logo=github&logoColor=white&label=CodeQL"></a>
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-green?style=flat-square"></a>
-  <img alt="Python 3.8+" src="https://img.shields.io/badge/python-3.8%2B-3776AB?style=flat-square&logo=python&logoColor=white">
+  <img alt="Python 3.10+" src="https://img.shields.io/badge/python-3.10%2B-3776AB?style=flat-square&logo=python&logoColor=white">
   <a href="https://github.com/astral-sh/ruff"><img alt="Linting: Ruff" src="https://img.shields.io/badge/linting-ruff-261230?style=flat-square&logo=ruff&logoColor=white"></a>
   <img alt="Zero dependencies" src="https://img.shields.io/badge/dependencies-zero-success?style=flat-square">
 </p>
@@ -30,7 +31,7 @@ So it answers three questions a fit/no-fit catalog does not:
    that fits with a safety margin) and a concurrency planner (how many parallel
    streams or model replicas fit at once).
 
-Pure Python standard library. No dependencies.
+Pure Python standard library (3.10+). No dependencies.
 
 ## Install
 
@@ -85,10 +86,15 @@ sparkfit /models/my-model/config.json   # a local config.json (file or dir)
 ```
 
 <p align="center">
-  <img alt="sparkfit planning llama3.1-70b on a DGX Spark" src="assets/demo.svg" width="720">
+  <img alt="sparkfit planning llama3.1-70b on a DGX Spark" src="https://raw.githubusercontent.com/engineering87/sparkfit/main/assets/demo.svg" width="720">
 </p>
 
 Override any default: `sparkfit qwen2.5-72b -c 16384 -n 4 -q q5_k_m`.
+
+If the model's `config.json` declares its quantization (`quantization_config`),
+sparkfit uses it instead of guessing: FP8, GPTQ, AWQ, bitsandbytes,
+compressed-tensors, and the Blackwell-native 4-bit formats MXFP4 (gpt-oss) and
+NVFP4 (ModelOpt, compressed-tensors) are recognized. An explicit `-q` still wins.
 
 ### Co-serving several models
 
@@ -102,14 +108,37 @@ others down:
 sparkfit serve qwen2.5-7b:fp8:8192 gemma2-9b:fp8:4096 llama3.2-3b:fp8:2048
 ```
 
-Each token is `NAME[:quant[:context]]`; quant and context fall back to `-q` and
-`-c`. As a worst case, N models decoding at once each get about their solo speed
-divided by N; idle or bursty models free their share.
+Each token is `NAME[:quant[:context]]`, where `NAME` can be a catalog id, a Hugging
+Face id or URL, or a local model path (Windows paths such as `C:\models\x:fp8`
+work too). Without a per-model quant, an explicit `-q` applies, then the quant
+detected from the model's config, then `q4_k_m`; context falls back to `-c`. `-b` and `-n` set the streams served by each model,
+which grow its KV-cache and split its decode speed. As a worst case, N models
+decoding at once each get about their solo speed divided by N; idle or bursty
+models free their share.
+
+### Clustering several Sparks
+
+`cluster` plans one model across several DGX Spark nodes linked by the ConnectX-7
+fabric (200 Gb/s, about 25 GB/s, over 10x slower than on-node memory). Weights,
+KV-cache and activations split evenly across the nodes, so a model too big for one
+box can fit on several:
+
+```bash
+sparkfit cluster deepseek-r1 -N 4 -q q4_k_m            # pipeline parallel (default)
+sparkfit cluster llama3.1-70b -N 2 --parallelism tp    # tensor parallel, one stream
+```
+
+Throughput scales sub-linearly: each extra node adds `--scaling` (0..1, default
+0.5) of one node's speed, reduced in proportion when `--fabric-gbps` is below the
+200 Gb/s reference. A faster fabric does not raise it further, so N nodes never
+report more than N times one node. Pipeline parallelism reports aggregate
+throughput; tensor parallelism reports single-stream speed.
 
 ### `--live`: plan against the memory free right now
 
 Run on the Spark, `--live` budgets against currently-free memory (read from
-`/proc/meminfo` and `nvidia-smi`) instead of the theoretical 128 GB, and waives
+`/proc/meminfo` and `nvidia-smi`, converted to decimal GB) instead of the
+theoretical 128 GB, and waives
 the OS reserve, since the free figure already excludes the OS and running
 processes. Useful when you already have models or containers loaded and want to
 know what you can still add.
@@ -129,7 +158,7 @@ sparkfit qwen2.5-32b --live
 | `fit`    | Scans the model DB for what fits; `--concurrency-scan` finds max parallel streams |
 | `serve`  | Plans several models co-served at once: shared memory and shared bandwidth |
 | `cluster`| Plans one model across several Spark nodes: combined memory and the inter-node fabric |
-| `doctor` | Calibrates efficiency to your device from a measured tok/s and saves it |
+| `doctor` | Calibrates bandwidth efficiency (from a measured tok/s) and prefill MFU (from a measured time-to-first-token) to your device and saves them |
 | `scan`   | Live snapshot when run on the Spark: memory, GPU temperature and thermal throttling |
 | `models` | Lists the built-in model database |
 
@@ -138,12 +167,21 @@ scripting).
 
 ### Key flags
 
-`-q/--quant` (default `q4_k_m` for `plan`, `advise`, `fit`; auto in quick mode),
-`-c/--context`, `-b/--batch`, `-n/--concurrency`,
+`-q/--quant` (default `q4_k_m` for `plan`, `advise`, `fit`; for `serve`, `cluster`
+and `doctor` the quant detected from the model's config, or the shipped MXFP4 of
+the built-in gpt-oss models, else `q4_k_m`; auto in quick mode), `-c/--context`, `-b/--batch`, `-n/--concurrency`,
 `--kv-dtype {fp16,bf16,fp8,int8,q4}`, `--os-reserve` (GB, default 8),
 `--framework` (GB, default 2), `--total-mem`, `--bandwidth`, `--efficiency` (default 0.70),
-`--engine {vllm,llama.cpp,ollama}` (per-engine efficiency preset), `--live`, `--json`.
-For models not in the DB: `--params --active --layers --hidden --kv-heads --head-dim`.
+`--engine {vllm,llama.cpp,ollama}` (per-engine efficiency and step-overhead preset),
+`--step-overhead-ms` (default 4), `--prompt-tokens`,
+`--mfu`, `--compute-tflops`, `--live`, `--json`.
+For models not in the DB: `--params --active --layers --hidden --kv-heads --head-dim`,
+plus `--experts --top-k` for a MoE (used for batched decode).
+
+Values are checked before planning: `--efficiency` and `--mfu` must be in (0, 1],
+`--os-reserve`, `--framework` and `--step-overhead-ms` at least 0, and `--total-mem`, `--bandwidth`,
+`--compute-tflops` and `--weights-gb` above 0. This also applies to values coming
+from `SPARKFIT_*` variables or the config file.
 
 ## Methodology
 
@@ -203,14 +241,42 @@ bandwidth actually reached:
 ```
 streams           = batch * concurrency
 bytes_per_step    = active_weights + kv_per_token * context * streams
-tok_s_aggregate   = streams * bandwidth * eff / bytes_per_step
+step_time         = bytes_per_step / (bandwidth * eff) + step_overhead
+tok_s_aggregate   = streams / step_time
 tok_s_per_stream  = tok_s_aggregate / streams
 ```
 
-Defaults: `bandwidth` 273 GB/s, `eff` 0.70. Weights are read once per step but the
-KV-cache is read for all streams, so adding concurrency raises aggregate
-throughput while each stream gets slower. For MoE only the active parameters are
-read, which is why a large MoE can be far faster than its total size suggests.
+Defaults: `bandwidth` 273 GB/s, `eff` 0.70, `step_overhead` 4 ms. Weights are read
+once per step but the KV-cache is read for all streams, so adding concurrency
+raises aggregate throughput while each stream gets slower.
+
+`step_overhead` is the fixed cost every step pays whatever the model size: kernel
+launches, sampling, scheduling and MoE routing. For a 70B model it is noise next
+to a ~300 ms step, but for a model with ~3B active parameters, whose step streams
+only a couple of GB in ~10 ms, it is a large share; without it those models were
+estimated up to 2x too fast. `--engine` sets it with the efficiency (vLLM 4 ms,
+llama.cpp 1 ms, ollama 2 ms: llama.cpp numbers usually come from `llama-bench`,
+which leaves out server overhead). Override it with `--step-overhead-ms` or
+`SPARKFIT_STEP_MS`.
+
+For a Mixture-of-Experts, `active_weights` is what the batch actually touches. A
+single stream reads only its active parameters, which is why a large MoE can be far
+faster than its total size suggests. With many streams, different tokens are
+routed to different experts, so each step reads the always-on part (attention,
+embeddings, shared experts) plus every expert picked by at least one token. With E
+routed experts, top-k routing and B tokens per step:
+
+```
+experts_touched  = E * (1 - (1 - k/E)^B)
+active_weights   = always_on + experts_touched * params_per_expert
+```
+
+For gpt-oss-120b (128 experts, top-4), 64 concurrent streams already touch about
+87% of the experts, so batched MoE serving is much closer to a dense model of the
+same total size than single-stream decode suggests. This assumes uniform routing;
+real routing skew touches somewhat fewer experts. Built-in MoE models carry their
+expert counts, Hugging Face configs provide them, and for a custom model pass
+`--experts` and `--top-k`.
 
 Prefill (processing the prompt) is instead compute-bound for long prompts and
 bandwidth-bound (stream the weights once) for short ones, so the time to first
@@ -218,14 +284,24 @@ token is modeled as `max(compute_time, memory_time)`:
 
 ```
 compute_time = (2 * active_params * prompt + 2 * layers * prompt^2 * hidden)
-               / (peak_tflops * precision_mult * mfu)
+               / (bf16_tflops * precision_mult * moe_factor * mfu)
 memory_time  = weights_bytes / (bandwidth * eff)
 ttft         = max(compute_time, memory_time)
 ```
 
-`precision_mult` is 2 for fp8 and 4 for fp4 (native low-precision matmul), 1
-otherwise; `mfu` (default 0.30) and `peak_tflops` are calibratable with `--mfu`
-and `--compute-tflops`. Set `--prompt-tokens` to size the prompt.
+- `bf16_tflops` is 100, the dense BF16 matmul throughput measured on GB10
+  (MAMF/GEMM benchmarks report about 99 to 100 TFLOPS, below the ~125 theoretical).
+- `precision_mult` is 2 for fp8 and 3.5 for fp4 (measured: about 200 and 350
+  TFLOPS), and 1 otherwise. It is also 1 with `--engine llama.cpp` or `ollama`,
+  which dequantize weights and compute in 16-bit.
+- `moe_factor` is 0.5 for MoE models, whose prefill runs many small per-expert
+  GEMMs that reach a lower fraction of peak than one large dense GEMM.
+- `mfu` defaults to 0.30.
+
+With these defaults, gpt-oss-120b on llama.cpp prefills about 1,400 tokens/s,
+against about 1,700 measured on GB10. Calibrate `mfu` from your own measurement
+with `sparkfit doctor --measured-ttft` (see below), or set it with `--mfu`;
+`--compute-tflops` overrides the BF16 base and `--prompt-tokens` sizes the prompt.
 
 ### Reserves and parameter estimation
 
@@ -262,20 +338,38 @@ To calibrate efficiency, run a known model on your serving stack, note the real
 decode tok/s, and let `sparkfit doctor` do the arithmetic and save it:
 
 ```bash
-sparkfit doctor --measured-tok-s 6.8 --weights-gb 35.9 --save   # -> efficiency ~0.89
+sparkfit doctor --measured-tok-s 6.8 --weights-gb 35.9 --save   # -> efficiency ~0.92
 sparkfit doctor --engine vllm --save                            # or start from a preset
 ```
 
+Prefill is calibrated the same way from a measured time-to-first-token. Use a long
+prompt, so the measurement is compute-bound rather than limited by reading the
+weights once; `doctor` refuses to save an MFU taken at that bandwidth floor:
+
+```bash
+sparkfit doctor --measured-ttft 4.2 -m llama3.1-8b -q fp8 --engine vllm \
+  --prompt-tokens 16384 --save                                  # -> prefill MFU ~0.40
+```
+
+Both measurements can be passed in one run.
+
 `doctor` writes the value to `~/.sparkfitrc` (override with `$SPARKFIT_CONFIG`), which
 every command reads as a default. Precedence is flag > environment variable > config
-file > built-in default, so an explicit `--efficiency` on a single run always wins.
-
+file > `--engine` preset > built-in default, so an explicit `--efficiency` on a single
+run always wins, and a value calibrated on your device is not replaced by the
+generic `--engine` preset. A calibration saves the efficiency together with the
+step overhead it was computed with, so the next runs reproduce the measurement.
+The file holds `key = value` lines; the recognized keys are `efficiency`,
+`bandwidth`, `os_reserve`, `framework`, `mfu`, `tflops` and `step_ms`.
 
 A robust, architecture-independent shortcut is
 `efficiency ~= measured_tok_s * weights_GB / 273`, where `weights_GB` is the
 on-disk size of the weight files. Measured example: a DGX Spark serving an FP8
 model under vLLM (no other load) reached 6.8 tok/s against 35.9 GB of weights,
-i.e. about 0.85 efficiency, well above the conservative 0.70 default.
+i.e. about 0.89 efficiency (6.8 * 35.9 / 273), well above the conservative 0.70
+default. `doctor` also subtracts the fixed step overhead from each measured step
+before dividing, so for the same measurement it reports about 0.92; the
+difference matters only for small, fast models.
 
 ### Validation on a real DGX Spark
 
@@ -288,9 +382,9 @@ Measured on a DGX Spark serving FP8 models with vLLM:
   streams (6.8, 13.5, 26.4, 51.9 tok/s; per-stream 6.8 down to 6.5), matching
   sparkfit's batched-decode model within about 5%.
 - Contention: co-serving a second model (a 4B embedding model under load) on
-  the same unified memory cut the generator from 6.8 to 3.8 tok/s. sparkfit
-  assumes a model gets the full 273 GB/s, so when you co-serve, model your
-  share by lowering `--bandwidth` or `--efficiency`.
+  the same unified memory cut the generator from 6.8 to 3.8 tok/s. Single-model
+  commands assume a model gets the full 273 GB/s; to plan co-serving, use
+  `sparkfit serve`, which splits the bandwidth across the models decoding at once.
 
 These are capacity-planning estimates, not measurements. For exact numbers,
 cross-check with `sparkfit scan` on the real machine.
@@ -309,9 +403,9 @@ dominant constraint for token generation.
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) and the [Code of Conduct](CODE_OF_CONDUCT.md).
+See [CONTRIBUTING.md](https://github.com/engineering87/sparkfit/blob/main/CONTRIBUTING.md) and the [Code of Conduct](https://github.com/engineering87/sparkfit/blob/main/CODE_OF_CONDUCT.md).
 Issues and pull requests are welcome.
 
 ## License
 
-[MIT](LICENSE).
+[MIT](https://github.com/engineering87/sparkfit/blob/main/LICENSE).

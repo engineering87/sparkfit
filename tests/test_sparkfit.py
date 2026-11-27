@@ -209,9 +209,11 @@ def test_total_mem_negative_errors():
 
 def test_efficiency_flag_scales_tok_s(capsys):
     import json
-    sf.main(["plan", "-m", "llama3.1-8b", "-q", "q4_k_m", "--efficiency", "0.35", "--json"])
+    sf.main(["plan", "-m", "llama3.1-8b", "-q", "q4_k_m", "--efficiency", "0.35",
+             "--step-overhead-ms", "0", "--json"])
     low = json.loads(capsys.readouterr().out)["decode_tok_s"]["per_stream"]
-    sf.main(["plan", "-m", "llama3.1-8b", "-q", "q4_k_m", "--efficiency", "0.70", "--json"])
+    sf.main(["plan", "-m", "llama3.1-8b", "-q", "q4_k_m", "--efficiency", "0.70",
+             "--step-overhead-ms", "0", "--json"])
     high = json.loads(capsys.readouterr().out)["decode_tok_s"]["per_stream"]
     assert high == pytest.approx(2 * low, rel=0.02)
 
@@ -524,6 +526,19 @@ def test_quick_explicit_quant_overrides_detected(tmp_path, capsys):
     assert out["chosen_quant"] == "q4_k_m"  # explicit -q wins
 
 
+def test_builtin_gpt_oss_defaults_to_native_mxfp4(capsys):
+    import json
+    sf.main(["gpt-oss-120b", "--json"])
+    out = json.loads(capsys.readouterr().out)
+    assert out["chosen_quant"] == "mxfp4"  # shipped format, not the ladder's q6_k
+    sf.main(["gpt-oss-120b"])
+    assert "mxfp4 (native)" in capsys.readouterr().out
+    sf.main(["serve", "gpt-oss-20b", "--json"])
+    assert json.loads(capsys.readouterr().out)["models"][0]["quant"] == "mxfp4"
+    sf.main(["gpt-oss-120b", "-q", "q4_k_m", "--json"])
+    assert json.loads(capsys.readouterr().out)["chosen_quant"] == "q4_k_m"
+
+
 def test_no_quant_config_leaves_detection_none(tmp_path, capsys):
     import json
     (tmp_path / "config.json").write_text(json.dumps({
@@ -538,7 +553,7 @@ def test_no_quant_config_leaves_detection_none(tmp_path, capsys):
 
 def test_compute_mult_mapping():
     assert sf._compute_mult("fp8") == 2.0
-    assert sf._compute_mult("nvfp4") == 4.0
+    assert sf._compute_mult("nvfp4") == 3.5  # measured NVFP4 GEMM ~347 vs BF16 ~100 TFLOPS
     assert sf._compute_mult("q4_k_m") == 1.0  # GGUF dequantizes to fp16 for compute
 
 
@@ -723,7 +738,8 @@ def test_cli_cluster_text(capsys):
 
 def test_doctor_calibrates_efficiency_from_measurement(capsys):
     import json
-    sf.main(["doctor", "--measured-tok-s", "6.8", "--weights-gb", "35.9", "--json"])
+    sf.main(["doctor", "--measured-tok-s", "6.8", "--weights-gb", "35.9",
+             "--step-overhead-ms", "0", "--json"])
     d = json.loads(capsys.readouterr().out)
     assert d["calibrated_efficiency"] == pytest.approx(0.894, abs=0.01)  # ~0.89 on real Spark
 
@@ -782,7 +798,8 @@ def test_load_config_ignores_unknown_and_comments(tmp_path):
 def test_doctor_bandwidth_from_env(capsys, monkeypatch):
     import json
     monkeypatch.setenv("SPARKFIT_BANDWIDTH", "136.5")  # half bandwidth -> double efficiency
-    sf.main(["doctor", "--measured-tok-s", "6.8", "--weights-gb", "35.9", "--json"])
+    sf.main(["doctor", "--measured-tok-s", "6.8", "--weights-gb", "35.9",
+             "--step-overhead-ms", "0", "--json"])
     d = json.loads(capsys.readouterr().out)
     assert d["bandwidth_gbps"] == pytest.approx(136.5)
     assert d["calibrated_efficiency"] == pytest.approx(0.894 * 2, abs=0.02)
@@ -898,3 +915,456 @@ def test_write_config_preserves_comments_and_unknown(tmp_path):
     text = p.read_text()
     assert "# my notes" in text and "my_custom = keep-me" in text
     assert "efficiency = 0.85" in text
+
+
+# --- v0.6.0 review fixes ---
+
+def _json_out(capsys, argv):
+    import json
+    sf.main(argv)
+    return json.loads(capsys.readouterr().out)
+
+
+def test_redirected_cp1252_output_does_not_crash(monkeypatch):
+    import io
+    raw = io.BytesIO()
+    stream = io.TextIOWrapper(raw, encoding="cp1252")
+    monkeypatch.setattr(sf.sys, "stdout", stream)
+    sf.main(["llama3.1-8b"])  # used to raise UnicodeEncodeError on the bar glyphs
+    sf.sys.stdout.flush()
+    text = raw.getvalue().decode("utf-8")
+    assert "FITS" in text and "─" in text
+
+
+def test_cluster_fast_fabric_never_superlinear(capsys):
+    d = _json_out(capsys, ["cluster", "llama3.1-70b", "-N", "4", "-q", "fp8",
+                           "--fabric-gbps", "800", "--scaling", "1", "--json"])
+    assert d["decode_tok_s"]["scaling_mult"] <= 4.0
+
+
+@pytest.mark.parametrize("flags", [["--fabric-gbps", "-100"], ["--fabric-gbps", "0"],
+                                   ["--scaling", "1.5"]])
+def test_cluster_rejects_bad_fabric_and_scaling(flags):
+    with pytest.raises(SystemExit):
+        sf.main(["cluster", "llama3.1-8b", "-N", "2"] + flags)
+
+
+def _fp8_local_model(tmp_path):
+    import json
+    (tmp_path / "config.json").write_text(json.dumps({
+        "hidden_size": 4096, "num_hidden_layers": 32, "num_attention_heads": 32,
+        "num_key_value_heads": 8, "vocab_size": 128256, "intermediate_size": 14336,
+        "quantization_config": {"quant_method": "fp8"}}))
+    return str(tmp_path)
+
+
+def test_cluster_uses_detected_quant(tmp_path, capsys):
+    path = _fp8_local_model(tmp_path)
+    assert _json_out(capsys, ["cluster", path, "--json"])["quant"] == "fp8"
+    assert _json_out(capsys, ["cluster", path, "-q", "q4_k_m", "--json"])["quant"] == "q4_k_m"
+
+
+def test_doctor_uses_detected_quant(tmp_path, capsys):
+    path = _fp8_local_model(tmp_path)
+    auto = _json_out(capsys, ["doctor", "--measured-tok-s", "10", "-m", path, "--json"])
+    fp8 = _json_out(capsys, ["doctor", "--measured-tok-s", "10", "-m", path, "-q", "fp8", "--json"])
+    assert auto["calibrated_efficiency"] == pytest.approx(fp8["calibrated_efficiency"])
+
+
+@pytest.mark.parametrize("qc,expected", [
+    ({"quant_method": "mxfp4"}, "mxfp4"),
+    ({"quant_method": "modelopt", "quant_algo": "NVFP4"}, "nvfp4"),
+    ({"quant_method": "modelopt", "quant_algo": "FP8"}, "fp8"),
+    ({"quant_method": "compressed-tensors",
+      "config_groups": {"g": {"weights": {"num_bits": 4, "type": "float"}}}}, "nvfp4"),
+    ({"quant_method": "compressed-tensors", "format": "nvfp4-pack-quantized"}, "nvfp4"),
+    ({"quant_method": "compressed-tensors",
+      "config_groups": {"g": {"weights": {"num_bits": 4, "type": "int"}}}}, "q4_0"),
+])
+def test_detect_quant_blackwell_formats(qc, expected):
+    assert sf._detect_quant({"quantization_config": qc}) == expected
+
+
+@pytest.mark.parametrize("token,expected", [
+    ("llama3.1-8b", ("llama3.1-8b", None, None)),
+    ("llama3.1-8b:fp8", ("llama3.1-8b", "fp8", None)),
+    ("llama3.1-8b:fp8:4096", ("llama3.1-8b", "fp8", "4096")),
+    ("llama3.1-8b::4096", ("llama3.1-8b", None, "4096")),
+    ("https://huggingface.co/org/m", ("https://huggingface.co/org/m", None, None)),
+    (r"C:\nope\model", (r"C:\nope\model", None, None)),
+    (r"C:\nope\model:fp8:2048", (r"C:\nope\model", "fp8", "2048")),
+])
+def test_split_serve_token(token, expected):
+    assert sf.split_serve_token(token) == expected
+
+
+def test_split_serve_token_existing_path_with_suffix(tmp_path):
+    path = _fp8_local_model(tmp_path)
+    assert sf.split_serve_token(f"{path}:q4_k_m:1024") == (path, "q4_k_m", "1024")
+
+
+def test_serve_local_path(tmp_path, capsys):
+    path = _fp8_local_model(tmp_path)
+    d = _json_out(capsys, ["serve", f"{path}::2048", "--json"])
+    assert d["models"][0]["quant"] == "fp8" and d["models"][0]["context"] == 2048
+
+
+def test_serve_honours_concurrency(capsys):
+    one = _json_out(capsys, ["serve", "llama3.1-8b:fp8:8192", "--json"])
+    eight = _json_out(capsys, ["serve", "llama3.1-8b:fp8:8192", "-n", "8", "--json"])
+    assert eight["streams_per_model"] == 8
+    assert eight["models"][0]["kv_gb"] == pytest.approx(8 * one["models"][0]["kv_gb"], rel=0.02)
+    assert eight["memory_gb"]["used"] > one["memory_gb"]["used"]
+    assert eight["models"][0]["tok_s_alone"] < one["models"][0]["tok_s_alone"]
+    assert one["models"][0]["prefill_ttft_s"] > 0
+
+
+@pytest.mark.parametrize("flags", [
+    ["--efficiency", "0"], ["--efficiency", "1.5"], ["--mfu", "-0.1"], ["--mfu", "2"],
+    ["--os-reserve", "-1"], ["--framework", "-1"], ["--total-mem", "0"],
+    ["--bandwidth", "-5"], ["--compute-tflops", "0"], ["--weights-gb", "-3"],
+])
+def test_invalid_numeric_options_rejected(flags):
+    with pytest.raises(SystemExit):
+        sf.main(["plan", "-m", "llama3.1-8b"] + flags)
+
+
+def test_invalid_efficiency_from_env_rejected(monkeypatch):
+    monkeypatch.setenv("SPARKFIT_EFFICIENCY", "7")
+    with pytest.raises(SystemExit):
+        sf.main(["plan", "-m", "llama3.1-8b"])
+
+
+def test_zero_os_reserve_allowed(capsys):
+    assert _json_out(capsys, ["plan", "-m", "llama3.1-8b", "--os-reserve", "0", "--json"])["fits"]
+
+
+def test_live_units_are_decimal_gb(monkeypatch):
+    import io
+    monkeypatch.setattr(sf.shutil, "which", lambda name: "/usr/bin/nvidia-smi")
+
+    def fake_check_output(cmd, **kw):
+        q = cmd[1]
+        if "memory" in q:
+            return "122880, 20480, 102400\n"  # MiB
+        if "temperature" in q:
+            return "55\n"
+        if "clocks_event_reasons" in q:
+            raise sf.subprocess.CalledProcessError(2, cmd)  # old driver
+        return "Not Active, Active\n"
+
+    monkeypatch.setattr(sf.subprocess, "check_output", fake_check_output)
+    real_open = open
+    monkeypatch.setattr("builtins.open", lambda p, *a, **k: io.StringIO(
+        "MemTotal:       125829120 kB\nMemAvailable:   104857600 kB\n")
+        if p == "/proc/meminfo" else real_open(p, *a, **k))
+    info = sf.read_live_mem()
+    assert info["gpu"]["total_gb"] == pytest.approx(122880 * 1024 * 1024 / 1e9)
+    assert info["gpu"]["free_gb"] == pytest.approx(107.37, abs=0.01)
+    assert info["host"]["total_gb"] == pytest.approx(128.85, abs=0.01)
+    assert info["thermal"]["sw_throttle"] is True and info["thermal"]["hw_throttle"] is False
+
+
+def test_concurrency_scan_reports_cap(capsys):
+    d = _json_out(capsys, ["fit", "-m", "llama3.2-1b", "-q", "q4_k_m", "-c", "128",
+                           "--concurrency-scan", "--json"])
+    assert d["max_concurrency"] == sf.MAX_CONCURRENCY_SCAN and d["capped"] is True
+    d = _json_out(capsys, ["fit", "-m", "llama3.1-70b", "-q", "q4_k_m",
+                           "--concurrency-scan", "--json"])
+    assert d["capped"] is False
+
+
+def test_config_file_reread_each_run(tmp_path, capsys, monkeypatch):
+    rc = tmp_path / "rc"
+    rc.write_text("efficiency = 0.35\n")
+    monkeypatch.setenv("SPARKFIT_CONFIG", str(rc))
+    slow = _json_out(capsys, ["plan", "-m", "llama3.1-8b", "-q", "fp8", "--json"])
+    ref = _json_out(capsys, ["plan", "-m", "llama3.1-8b", "-q", "fp8",
+                             "--efficiency", "0.35", "--json"])
+    assert slow["decode_tok_s"]["per_stream"] == pytest.approx(ref["decode_tok_s"]["per_stream"])
+
+
+def test_version_is_060():
+    assert sf.__version__ == "0.6.0"
+
+
+# --- v0.6.0: MoE batched decode and recalibrated prefill ---
+
+def test_streamed_params_dense_is_constant():
+    spec = sf.MODELS["llama3.1-70b"]
+    assert sf.streamed_params_b(spec, 1) == spec["active_b"]
+    assert sf.streamed_params_b(spec, 64) == spec["active_b"]
+
+
+def test_streamed_params_moe_grows_with_batch():
+    spec = sf.MODELS["gpt-oss-120b"]  # 128 experts, top-4
+    one = sf.streamed_params_b(spec, 1)
+    big = sf.streamed_params_b(spec, 64)
+    assert one == pytest.approx(spec["active_b"])
+    # 64 tokens touch ~87% of the 128 experts: most of the model is read per step
+    assert 0.8 * spec["total_b"] < big <= spec["total_b"]
+    assert sf.streamed_params_b(spec, 10_000) == pytest.approx(spec["total_b"], rel=1e-3)
+
+
+def test_streamed_params_moe_without_expert_counts_falls_back():
+    spec = dict(sf.MODELS["gpt-oss-120b"])
+    del spec["n_experts"], spec["top_k"]
+    assert sf.streamed_params_b(spec, 64) == spec["active_b"]
+
+
+def test_moe_batched_aggregate_no_longer_scales_linearly():
+    spec = sf.MODELS["gpt-oss-120b"]
+    one = sf.decode_tok_s(spec, "mxfp4", 512, 1, efficiency=0.85)["aggregate"]
+    many = sf.decode_tok_s(spec, "mxfp4", 512, 64, efficiency=0.85)["aggregate"]
+    assert many < 10 * one  # was ~60x when only the active experts were counted
+
+
+def test_builtin_moe_models_have_expert_counts():
+    for name, s in sf.MODELS.items():
+        if s.get("moe"):
+            assert s["n_experts"] > s["top_k"] > 0, name
+
+
+def test_parse_hf_config_records_experts():
+    cfg = {"hidden_size": 2880, "num_hidden_layers": 36, "num_attention_heads": 64,
+           "num_key_value_heads": 8, "head_dim": 64, "intermediate_size": 2880,
+           "num_local_experts": 128, "num_experts_per_tok": 4, "vocab_size": 201088}
+    spec = sf.parse_hf_config(cfg)
+    assert spec["n_experts"] == 128 and spec["top_k"] == 4
+
+
+def test_custom_moe_expert_flags(capsys):
+    import json
+    base = ["plan", "--params", "100", "--active", "10", "-q", "q4_k_m", "-n", "32", "--json"]
+    sf.main(base)
+    no_experts = json.loads(capsys.readouterr().out)["decode_tok_s"]["aggregate"]
+    sf.main(base + ["--experts", "64", "--top-k", "4"])
+    with_experts = json.loads(capsys.readouterr().out)["decode_tok_s"]["aggregate"]
+    assert with_experts < no_experts
+    with pytest.raises(SystemExit):
+        sf.main(base + ["--experts", "4", "--top-k", "4"])
+
+
+def test_measured_moe_weights_scale_with_streamed_share():
+    spec = sf.MODELS["gpt-oss-120b"]
+    full = 65.0  # GB on disk for the whole model
+    b1 = sf.streamed_weight_bytes(spec, "mxfp4", 1, full)
+    assert b1 == pytest.approx(full * sf.GB * spec["active_b"] / spec["total_b"])
+
+
+def test_prefill_engine_dequant_removes_precision_speedup():
+    spec = sf.MODELS["llama3.1-8b"]
+    native = sf.prefill_stats(spec, "fp8", 8192)["compute_s"]
+    llama_cpp = sf.prefill_stats(spec, "fp8", 8192, engine="llama.cpp")["compute_s"]
+    assert llama_cpp == pytest.approx(native * sf.FP8_COMPUTE_MULT)
+
+
+def test_prefill_moe_penalty():
+    dense = dict(sf.MODELS["llama3.1-8b"])
+    moe = dict(dense, moe=True)
+    a = sf.prefill_stats(dense, "fp16", 8192)["compute_s"]
+    b = sf.prefill_stats(moe, "fp16", 8192)["compute_s"]
+    assert b == pytest.approx(a / sf.MOE_PREFILL_MFU_FACTOR)
+
+
+def test_prefill_gpt_oss_120b_llama_cpp_close_to_measured():
+    # Published llama.cpp runs on GB10 report ~1.7k prefill tok/s for gpt-oss-120b.
+    pf = sf.prefill_stats(sf.MODELS["gpt-oss-120b"], "mxfp4", 2048, engine="llama.cpp")
+    tok_s = pf["prompt_tokens"] / pf["ttft_s"]
+    assert 1000 < tok_s < 3000
+
+
+def test_doctor_measured_ttft_backs_out_mfu(capsys):
+    spec = sf.MODELS["llama3.1-8b"]
+    target_mfu = 0.42
+    flops = sf.prefill_flops(spec, 8192)
+    ceiling = sf.prefill_peak_flops(spec, "fp8", None, None, "vllm", apply_mfu=False)
+    ttft = flops / (ceiling * target_mfu)
+    d = _json_out(capsys, ["doctor", "--measured-ttft", f"{ttft:.6f}", "-m", "llama3.1-8b",
+                           "-q", "fp8", "--engine", "vllm", "--prompt-tokens", "8192", "--json"])
+    assert d["calibrated_mfu"] == pytest.approx(target_mfu, abs=0.005)
+    assert d["mfu_saved"] is True
+    assert "calibrated_efficiency" not in d
+
+
+def test_doctor_ttft_at_bandwidth_floor_not_saved(tmp_path, capsys, monkeypatch):
+    p = str(tmp_path / "rc")
+    monkeypatch.setenv("SPARKFIT_CONFIG", p)
+    d = _json_out(capsys, ["doctor", "--measured-ttft", "0.01", "-m", "llama3.1-70b",
+                           "-q", "fp8", "--prompt-tokens", "16", "--save", "--json"])
+    assert d["mfu_saved"] is False
+    assert "SPARKFIT_MFU" not in sf.load_config_file(p)
+
+
+def test_doctor_ttft_and_tok_s_together(tmp_path, capsys, monkeypatch):
+    p = str(tmp_path / "rc")
+    monkeypatch.setenv("SPARKFIT_CONFIG", p)
+    d = _json_out(capsys, ["doctor", "--measured-tok-s", "30", "--measured-ttft", "4",
+                           "-m", "llama3.1-8b", "-q", "fp8", "--prompt-tokens", "16384",
+                           "--save", "--json"])
+    cfg = sf.load_config_file(p)
+    assert "calibrated_efficiency" in d and "calibrated_mfu" in d
+    assert "SPARKFIT_EFFICIENCY" in cfg and "SPARKFIT_MFU" in cfg
+
+
+@pytest.mark.parametrize("argv", [
+    ["doctor", "--measured-ttft", "2"],                          # no model
+    ["doctor", "--measured-ttft", "-1", "-m", "llama3.1-8b"],    # non-positive
+])
+def test_doctor_measured_ttft_rejected(argv):
+    with pytest.raises(SystemExit):
+        sf.main(argv)
+
+
+# --- v0.6.0: fixed per-step decode overhead ---
+
+def test_step_overhead_slows_small_models_more():
+    small, big = sf.MODELS["qwen3-30b-a3b"], sf.MODELS["llama3.1-70b"]
+    def ratio(spec, q):
+        fast = sf.decode_tok_s(spec, q, 4096, overhead_ms=0)["per_stream"]
+        slow = sf.decode_tok_s(spec, q, 4096, overhead_ms=4)["per_stream"]
+        return slow / fast
+    assert ratio(small, "nvfp4") < 0.8        # ~10 ms steps: 4 ms is a big share
+    assert ratio(big, "fp8") > 0.95           # ~300 ms steps: 4 ms is noise
+
+
+def test_step_overhead_reported_and_engine_preset(capsys):
+    d = _json_out(capsys, ["plan", "-m", "qwen3-30b-a3b", "-q", "nvfp4", "--engine",
+                           "llama.cpp", "--json"])
+    vllm = _json_out(capsys, ["plan", "-m", "qwen3-30b-a3b", "-q", "nvfp4", "--engine",
+                              "vllm", "--json"])
+    spec = sf.MODELS["qwen3-30b-a3b"]
+    expect = sf.decode_tok_s(spec, "nvfp4", 4096, efficiency=0.55,
+                             overhead_ms=sf.ENGINE_STEP_OVERHEAD_MS["llama.cpp"])
+    assert d["decode_tok_s"]["per_stream"] == pytest.approx(expect["per_stream"], rel=0.01)
+    assert vllm["decode_tok_s"]["step_time_ms"] > 0
+
+
+def test_step_overhead_flag_env_and_validation(capsys, monkeypatch):
+    base = ["plan", "-m", "qwen3-30b-a3b", "-q", "nvfp4", "--json"]
+    zero = _json_out(capsys, base + ["--step-overhead-ms", "0"])["decode_tok_s"]["per_stream"]
+    monkeypatch.setenv("SPARKFIT_STEP_MS", "0")
+    env = _json_out(capsys, base)["decode_tok_s"]["per_stream"]
+    assert env == pytest.approx(zero)
+    with pytest.raises(SystemExit):
+        sf.main(base + ["--step-overhead-ms", "-1"])
+
+
+def test_qwen3_moe_vllm_estimate_in_measured_range(capsys):
+    # Published vLLM runs of ~3B-active MoE models in NVFP4 on GB10: ~47-67 tok/s.
+    d = _json_out(capsys, ["plan", "-m", "qwen3-30b-a3b", "-q", "nvfp4", "--engine", "vllm",
+                           "--json"])
+    assert 45 < d["decode_tok_s"]["per_stream"] < 80
+
+
+def test_doctor_subtracts_step_overhead(capsys):
+    base = ["doctor", "--measured-tok-s", "6.8", "--weights-gb", "35.9", "--json"]
+    raw = _json_out(capsys, base + ["--step-overhead-ms", "0"])["calibrated_efficiency"]
+    adj = _json_out(capsys, base + ["--step-overhead-ms", "4"])["calibrated_efficiency"]
+    assert adj > raw  # part of the measured step was fixed cost, not bandwidth
+    with pytest.raises(SystemExit):  # 1/500 s = 2 ms < 4 ms overhead: impossible
+        sf.main(["doctor", "--measured-tok-s", "500", "--weights-gb", "1",
+                 "--step-overhead-ms", "4"])
+
+
+def test_doctor_engine_preset_saves_step_overhead(tmp_path, capsys, monkeypatch):
+    p = str(tmp_path / "rc")
+    monkeypatch.setenv("SPARKFIT_CONFIG", p)
+    d = _json_out(capsys, ["doctor", "--engine", "llama.cpp", "--save", "--json"])
+    assert d["step_overhead_ms"] == sf.ENGINE_STEP_OVERHEAD_MS["llama.cpp"]
+    assert sf.load_config_file(p)["SPARKFIT_STEP_MS"] == str(sf.ENGINE_STEP_OVERHEAD_MS["llama.cpp"])
+
+
+# --- v0.6.0: second review pass ---
+
+def test_calibrated_efficiency_beats_engine_preset(tmp_path, capsys, monkeypatch):
+    rc = tmp_path / "rc"
+    rc.write_text("efficiency = 0.77\nstep_ms = 1\n")
+    monkeypatch.setenv("SPARKFIT_CONFIG", str(rc))
+    got = _json_out(capsys, ["plan", "-m", "llama3.2-3b", "-q", "q4_k_m", "--engine",
+                             "llama.cpp", "--json"])["decode_tok_s"]["per_stream"]
+    ref = sf.decode_tok_s(sf.MODELS["llama3.2-3b"], "q4_k_m", 4096, efficiency=0.77,
+                          overhead_ms=1)["per_stream"]
+    assert got == pytest.approx(ref, rel=0.01)
+
+
+def test_doctor_calibration_round_trips(tmp_path, capsys, monkeypatch):
+    p = str(tmp_path / "rc")
+    monkeypatch.setenv("SPARKFIT_CONFIG", p)
+    sf.main(["doctor", "--measured-tok-s", "80", "-m", "llama3.2-3b", "-q", "q4_k_m",
+             "--engine", "llama.cpp", "--save", "--json"])
+    capsys.readouterr()
+    assert sf.load_config_file(p)["SPARKFIT_STEP_MS"] == "1.0"
+    for extra in ([], ["--engine", "llama.cpp"], ["--engine", "vllm"]):
+        d = _json_out(capsys, ["plan", "-m", "llama3.2-3b", "-q", "q4_k_m", "--json"] + extra)
+        assert d["decode_tok_s"]["per_stream"] == pytest.approx(80, rel=0.02), extra
+
+
+def test_doctor_engine_preset_respects_explicit_step(capsys):
+    d = _json_out(capsys, ["doctor", "--engine", "vllm", "--step-overhead-ms", "2", "--json"])
+    assert d["step_overhead_ms"] == 2.0
+
+
+def test_doctor_settings_show_flags(capsys, monkeypatch):
+    monkeypatch.setattr(sf, "read_live_mem", lambda: {})
+    d = _json_out(capsys, ["doctor", "--step-overhead-ms", "2", "--bandwidth", "200", "--json"])
+    assert d["settings"]["step_ms"] == 2.0 and d["settings"]["bandwidth"] == 200.0
+
+
+@pytest.mark.parametrize("var,val", [("SPARKFIT_EFFICIENCY", "3"), ("SPARKFIT_MFU", "0"),
+                                     ("SPARKFIT_STEP_MS", "-1")])
+def test_doctor_rejects_bad_env(monkeypatch, var, val):
+    monkeypatch.setenv(var, val)
+    with pytest.raises(SystemExit):
+        sf.main(["doctor"])
+
+
+def test_serve_explicit_quant_beats_detected(tmp_path, capsys):
+    path = _fp8_local_model(tmp_path)
+    assert _json_out(capsys, ["serve", path, "--json"])["models"][0]["quant"] == "fp8"
+    assert _json_out(capsys, ["serve", path, "-q", "fp16", "--json"])["models"][0]["quant"] == "fp16"
+    d = _json_out(capsys, ["serve", f"{path}:q4_k_m", "-q", "fp16", "--json"])
+    assert d["models"][0]["quant"] == "q4_k_m"  # per-model suffix wins
+    assert _json_out(capsys, ["serve", "llama3.1-8b", "--json"])["models"][0]["quant"] == "q4_k_m"
+
+
+@pytest.mark.parametrize("token,expected", [
+    ("https://huggingface.co/Qwen/Qwen2.5-7B:fp8",
+     ("https://huggingface.co/Qwen/Qwen2.5-7B", "fp8", None)),
+    ("https://huggingface.co/Qwen/Qwen2.5-7B:fp8:4096",
+     ("https://huggingface.co/Qwen/Qwen2.5-7B", "fp8", "4096")),
+    ("Qwen/Qwen2.5-7B:fp8", ("Qwen/Qwen2.5-7B", "fp8", None)),
+])
+def test_split_serve_token_url_suffix(token, expected):
+    assert sf.split_serve_token(token) == expected
+
+
+@pytest.mark.parametrize("extra", [
+    ["--experts", "64"],                         # missing --top-k
+    ["--top-k", "4"],                            # missing --experts
+])
+def test_custom_moe_flags_incomplete_rejected(extra):
+    with pytest.raises(SystemExit):
+        sf.main(["plan", "--params", "100", "--active", "10"] + extra)
+
+
+def test_expert_flags_need_moe_or_custom():
+    with pytest.raises(SystemExit):  # dense custom model
+        sf.main(["plan", "--params", "100", "--experts", "64", "--top-k", "4"])
+    with pytest.raises(SystemExit):  # built-in model
+        sf.main(["plan", "-m", "llama3.1-8b", "--experts", "64", "--top-k", "4"])
+
+
+def test_vision_tower_not_in_expert_pool():
+    spec = {"total_b": 31.0, "active_b": 4.0, "vision_b": 1.0, "moe": True,
+            "n_experts": 128, "top_k": 8}
+    assert sf.streamed_params_b(spec, 100_000) == pytest.approx(30.0, rel=1e-3)
+
+
+@pytest.mark.parametrize("qc,expected", [
+    ({"quant_method": "fbgemm_fp8"}, "fp8"),
+    ({"quant_method": "gptq", "bits": 2}, "q2_k"),
+    ({"quant_method": "gptq", "bits": 6}, "q6_k"),
+])
+def test_detect_quant_more_formats(qc, expected):
+    assert sf._detect_quant({"quantization_config": qc}) == expected

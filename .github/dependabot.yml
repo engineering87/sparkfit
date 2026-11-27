@@ -1,0 +1,23 @@
+version: 2
+updates:
+  # GitHub Actions used by the CI, CodeQL and release workflows.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: ci
+
+  # Dev tooling in pyproject.toml (sparkfit itself has no runtime dependencies).
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      dev-tools:
+        patterns: ["*"]
+    commit-message:
+      prefix: chore

@@ -1,0 +1,41 @@
+name: CodeQL
+
+on:
+  push:
+    branches: [main, "release/**"]
+  pull_request:
+    branches: [main, "release/**"]
+  schedule:
+    - cron: "27 4 * * 1"   # weekly, Monday 04:27 UTC: catch newly published queries
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read            # read workflow run metadata
+      security-events: write   # upload results to the Security tab
+    strategy:
+      fail-fast: false
+      matrix:
+        # python: the CLI itself; actions: the GitHub workflows (injection, permissions).
+        language: [python, actions]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: none           # interpreted languages: nothing to build
+          queries: security-extended
+
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: "/language:${{ matrix.language }}"
