@@ -10,8 +10,9 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - MoE batched decode models expert coverage: with B tokens per step, a model with E
   routed experts and top-k routing reads about `E * (1 - (1 - k/E)^B)` distinct
   experts, not just the active parameters. Batched MoE throughput was previously
-  overstated several-fold (gpt-oss-120b at 64 streams: ~2,900 tok/s estimated
-  before, ~260 now, versus ~350-700 measured depending on how it is counted).
+  overstated several-fold (gpt-oss-120b, MXFP4, `--engine vllm -c 512 -n 64`:
+  ~2,900 tok/s aggregate estimated before, ~260 now, versus ~680-700 measured
+  counting input plus output tokens, ~350 output only).
   Built-in MoE models carry `n_experts`/`top_k`, Hugging Face configs provide
   them, and custom models take `--experts` and `--top-k`.
 - Decode adds a fixed cost per step (kernel launches, sampling, scheduling, MoE
@@ -19,10 +20,12 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `SPARKFIT_STEP_MS` / `step_ms` in the config, and an `--engine` preset (vLLM 4,
   llama.cpp 1, ollama 2). Small and few-active-parameter MoE models were estimated
   up to 2x too fast (qwen3-30b-a3b NVFP4 on vLLM: ~105 tok/s before, ~74 now,
-  ~47-67 measured); 8B+ dense models barely move. JSON output reports `step_ms`.
-  `doctor --measured-tok-s` subtracts it before backing out the efficiency (the
-  README example now calibrates to ~0.92 instead of ~0.89), and
-  `doctor --engine --save` saves it with the efficiency.
+  ~47-67 measured); 8B+ dense models barely move. `plan --json` reports the whole
+  decode step as `decode_tok_s.step_time_ms`. `doctor --measured-tok-s`
+  subtracts the overhead before backing out the efficiency (the README example
+  now calibrates to ~0.92 instead of ~0.89) and saves both values together, so
+  later runs reproduce the measurement; `doctor --engine --save` saves the preset
+  pair (an explicit `--step-overhead-ms` wins).
 - `doctor --measured-ttft SECONDS` (with `--model`, `--prompt-tokens`, `--engine`)
   backs out the prefill MFU from a measured time-to-first-token and can save it.
   It can be combined with `--measured-tok-s` in one run, and refuses to save an
@@ -37,6 +40,17 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (`"capped": true` in JSON, `256+` in text).
 
 ### Changed
+- Precedence of efficiency and step overhead is now flag > `SPARKFIT_*` > config
+  file > `--engine` preset > default: a value calibrated with `doctor` is no
+  longer silently replaced by the generic preset when `--engine` is passed.
+- `serve` resolves each model's quant as per-model suffix > explicit `-q` >
+  quant detected from the config > `q4_k_m` (an explicit `-q` used to lose to the
+  detected one), matching `cluster`.
+- `--experts`/`--top-k` must be given together, on a custom MoE (`--active` <
+  `--params`); they were silently ignored otherwise.
+- Quantization auto-detect also maps `fbgemm_fp8` to fp8 and 2/5/6-bit GPTQ-style
+  configs to `q2_k`/`q5_0`/`q6_k`; a multimodal MoE's vision tower is no longer
+  counted in the routed-expert pool.
 - Prefill roofline recalibrated to measured GB10 compute: dense BF16 base 100
   TFLOPS (was the ~125 theoretical), FP4 speedup 3.5x (was 4x), no precision
   speedup on engines that dequantize (`--engine llama.cpp`/`ollama`), and half
@@ -66,6 +80,9 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Packaging: the version is read from `sparkfit.__version__` (single source), the
   license uses an SPDX expression, and the release workflow runs the tests and
   checks that the tag matches the package version before publishing.
+- Security: CodeQL analysis (`security-extended` queries) of the Python code and of
+  the GitHub workflows on every push and pull request to `main`/`release/**` and
+  weekly, with a README badge.
 - Docs: the README covers `cluster`, quantization auto-detect, the `serve` spec
   format and option ranges, and fixes the calibration example (6.8 tok/s on
   35.9 GB is about 0.89 efficiency, not 0.85); SECURITY lists supported versions
@@ -76,7 +93,11 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Windows: redirecting or piping the output (`sparkfit llama3.1-8b > out.txt`) no
   longer crashes with `UnicodeEncodeError`; such streams are switched to UTF-8.
 - `serve` accepts Windows paths (`C:\models\x[:quant[:ctx]]`) instead of splitting
-  them at the drive letter.
+  them at the drive letter, and Hugging Face URLs with a suffix
+  (`https://huggingface.co/org/model:fp8`).
+- `doctor` validates `SPARKFIT_EFFICIENCY`, `SPARKFIT_MFU` and `SPARKFIT_STEP_MS`
+  like the other commands, and its settings report shows `--bandwidth` and
+  `--step-overhead-ms` when given.
 - The config file is re-read on every run, so `$SPARKFIT_CONFIG` set after import
   takes effect; the test suite no longer depends on the developer's `~/.sparkfitrc`.
 

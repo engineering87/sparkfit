@@ -7,6 +7,7 @@
 
 <p align="center">
   <a href="https://github.com/engineering87/sparkfit/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/engineering87/sparkfit/ci.yml?branch=main&style=flat-square&logo=githubactions&logoColor=white&label=CI"></a>
+  <a href="https://github.com/engineering87/sparkfit/actions/workflows/codeql.yml"><img alt="CodeQL" src="https://img.shields.io/github/actions/workflow/status/engineering87/sparkfit/codeql.yml?branch=main&style=flat-square&logo=github&logoColor=white&label=CodeQL"></a>
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-green?style=flat-square"></a>
   <img alt="Python 3.10+" src="https://img.shields.io/badge/python-3.10%2B-3776AB?style=flat-square&logo=python&logoColor=white">
   <a href="https://github.com/astral-sh/ruff"><img alt="Linting: Ruff" src="https://img.shields.io/badge/linting-ruff-261230?style=flat-square&logo=ruff&logoColor=white"></a>
@@ -108,9 +109,9 @@ sparkfit serve qwen2.5-7b:fp8:8192 gemma2-9b:fp8:4096 llama3.2-3b:fp8:2048
 ```
 
 Each token is `NAME[:quant[:context]]`, where `NAME` can be a catalog id, a Hugging
-Face id, or a local model path (Windows paths such as `C:\models\x:fp8` work too).
-Quant falls back to the one detected from the model's config, then to `-q`;
-context falls back to `-c`. `-b` and `-n` set the streams served by each model,
+Face id or URL, or a local model path (Windows paths such as `C:\models\x:fp8`
+work too). Without a per-model quant, an explicit `-q` applies, then the quant
+detected from the model's config, then `q4_k_m`; context falls back to `-c`. `-b` and `-n` set the streams served by each model,
 which grow its KV-cache and split its decode speed. As a worst case, N models
 decoding at once each get about their solo speed divided by N; idle or bursty
 models free their share.
@@ -157,7 +158,7 @@ sparkfit qwen2.5-32b --live
 | `fit`    | Scans the model DB for what fits; `--concurrency-scan` finds max parallel streams |
 | `serve`  | Plans several models co-served at once: shared memory and shared bandwidth |
 | `cluster`| Plans one model across several Spark nodes: combined memory and the inter-node fabric |
-| `doctor` | Calibrates efficiency to your device from a measured tok/s and saves it |
+| `doctor` | Calibrates bandwidth efficiency (from a measured tok/s) and prefill MFU (from a measured time-to-first-token) to your device and saves them |
 | `scan`   | Live snapshot when run on the Spark: memory, GPU temperature and thermal throttling |
 | `models` | Lists the built-in model database |
 
@@ -174,7 +175,8 @@ quick mode), `-c/--context`, `-b/--batch`, `-n/--concurrency`,
 `--engine {vllm,llama.cpp,ollama}` (per-engine efficiency and step-overhead preset),
 `--step-overhead-ms` (default 4), `--prompt-tokens`,
 `--mfu`, `--compute-tflops`, `--live`, `--json`.
-For models not in the DB: `--params --active --layers --hidden --kv-heads --head-dim`.
+For models not in the DB: `--params --active --layers --hidden --kv-heads --head-dim`,
+plus `--experts --top-k` for a MoE (used for batched decode).
 
 Values are checked before planning: `--efficiency` and `--mfu` must be in (0, 1],
 `--os-reserve`, `--framework` and `--step-overhead-ms` at least 0, and `--total-mem`, `--bandwidth`,
@@ -353,7 +355,10 @@ Both measurements can be passed in one run.
 
 `doctor` writes the value to `~/.sparkfitrc` (override with `$SPARKFIT_CONFIG`), which
 every command reads as a default. Precedence is flag > environment variable > config
-file > built-in default, so an explicit `--efficiency` on a single run always wins.
+file > `--engine` preset > built-in default, so an explicit `--efficiency` on a single
+run always wins, and a value calibrated on your device is not replaced by the
+generic `--engine` preset. A calibration saves the efficiency together with the
+step overhead it was computed with, so the next runs reproduce the measurement.
 The file holds `key = value` lines; the recognized keys are `efficiency`,
 `bandwidth`, `os_reserve`, `framework`, `mfu`, `tflops` and `step_ms`.
 

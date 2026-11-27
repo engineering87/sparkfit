@@ -1224,7 +1224,7 @@ def test_step_overhead_reported_and_engine_preset(capsys):
     expect = sf.decode_tok_s(spec, "nvfp4", 4096, efficiency=0.55,
                              overhead_ms=sf.ENGINE_STEP_OVERHEAD_MS["llama.cpp"])
     assert d["decode_tok_s"]["per_stream"] == pytest.approx(expect["per_stream"], rel=0.01)
-    assert vllm["decode_tok_s"]["step_ms"] > 0
+    assert vllm["decode_tok_s"]["step_time_ms"] > 0
 
 
 def test_step_overhead_flag_env_and_validation(capsys, monkeypatch):
@@ -1260,3 +1260,98 @@ def test_doctor_engine_preset_saves_step_overhead(tmp_path, capsys, monkeypatch)
     d = _json_out(capsys, ["doctor", "--engine", "llama.cpp", "--save", "--json"])
     assert d["step_overhead_ms"] == sf.ENGINE_STEP_OVERHEAD_MS["llama.cpp"]
     assert sf.load_config_file(p)["SPARKFIT_STEP_MS"] == str(sf.ENGINE_STEP_OVERHEAD_MS["llama.cpp"])
+
+
+# --- v0.6.0: second review pass ---
+
+def test_calibrated_efficiency_beats_engine_preset(tmp_path, capsys, monkeypatch):
+    rc = tmp_path / "rc"
+    rc.write_text("efficiency = 0.77\nstep_ms = 1\n")
+    monkeypatch.setenv("SPARKFIT_CONFIG", str(rc))
+    got = _json_out(capsys, ["plan", "-m", "llama3.2-3b", "-q", "q4_k_m", "--engine",
+                             "llama.cpp", "--json"])["decode_tok_s"]["per_stream"]
+    ref = sf.decode_tok_s(sf.MODELS["llama3.2-3b"], "q4_k_m", 4096, efficiency=0.77,
+                          overhead_ms=1)["per_stream"]
+    assert got == pytest.approx(ref, rel=0.01)
+
+
+def test_doctor_calibration_round_trips(tmp_path, capsys, monkeypatch):
+    p = str(tmp_path / "rc")
+    monkeypatch.setenv("SPARKFIT_CONFIG", p)
+    sf.main(["doctor", "--measured-tok-s", "80", "-m", "llama3.2-3b", "-q", "q4_k_m",
+             "--engine", "llama.cpp", "--save", "--json"])
+    capsys.readouterr()
+    assert sf.load_config_file(p)["SPARKFIT_STEP_MS"] == "1.0"
+    for extra in ([], ["--engine", "llama.cpp"], ["--engine", "vllm"]):
+        d = _json_out(capsys, ["plan", "-m", "llama3.2-3b", "-q", "q4_k_m", "--json"] + extra)
+        assert d["decode_tok_s"]["per_stream"] == pytest.approx(80, rel=0.02), extra
+
+
+def test_doctor_engine_preset_respects_explicit_step(capsys):
+    d = _json_out(capsys, ["doctor", "--engine", "vllm", "--step-overhead-ms", "2", "--json"])
+    assert d["step_overhead_ms"] == 2.0
+
+
+def test_doctor_settings_show_flags(capsys, monkeypatch):
+    monkeypatch.setattr(sf, "read_live_mem", lambda: {})
+    d = _json_out(capsys, ["doctor", "--step-overhead-ms", "2", "--bandwidth", "200", "--json"])
+    assert d["settings"]["step_ms"] == 2.0 and d["settings"]["bandwidth"] == 200.0
+
+
+@pytest.mark.parametrize("var,val", [("SPARKFIT_EFFICIENCY", "3"), ("SPARKFIT_MFU", "0"),
+                                     ("SPARKFIT_STEP_MS", "-1")])
+def test_doctor_rejects_bad_env(monkeypatch, var, val):
+    monkeypatch.setenv(var, val)
+    with pytest.raises(SystemExit):
+        sf.main(["doctor"])
+
+
+def test_serve_explicit_quant_beats_detected(tmp_path, capsys):
+    path = _fp8_local_model(tmp_path)
+    assert _json_out(capsys, ["serve", path, "--json"])["models"][0]["quant"] == "fp8"
+    assert _json_out(capsys, ["serve", path, "-q", "fp16", "--json"])["models"][0]["quant"] == "fp16"
+    d = _json_out(capsys, ["serve", f"{path}:q4_k_m", "-q", "fp16", "--json"])
+    assert d["models"][0]["quant"] == "q4_k_m"  # per-model suffix wins
+    assert _json_out(capsys, ["serve", "llama3.1-8b", "--json"])["models"][0]["quant"] == "q4_k_m"
+
+
+@pytest.mark.parametrize("token,expected", [
+    ("https://huggingface.co/Qwen/Qwen2.5-7B:fp8",
+     ("https://huggingface.co/Qwen/Qwen2.5-7B", "fp8", None)),
+    ("https://huggingface.co/Qwen/Qwen2.5-7B:fp8:4096",
+     ("https://huggingface.co/Qwen/Qwen2.5-7B", "fp8", "4096")),
+    ("Qwen/Qwen2.5-7B:fp8", ("Qwen/Qwen2.5-7B", "fp8", None)),
+])
+def test_split_serve_token_url_suffix(token, expected):
+    assert sf.split_serve_token(token) == expected
+
+
+@pytest.mark.parametrize("extra", [
+    ["--experts", "64"],                         # missing --top-k
+    ["--top-k", "4"],                            # missing --experts
+])
+def test_custom_moe_flags_incomplete_rejected(extra):
+    with pytest.raises(SystemExit):
+        sf.main(["plan", "--params", "100", "--active", "10"] + extra)
+
+
+def test_expert_flags_need_moe_or_custom():
+    with pytest.raises(SystemExit):  # dense custom model
+        sf.main(["plan", "--params", "100", "--experts", "64", "--top-k", "4"])
+    with pytest.raises(SystemExit):  # built-in model
+        sf.main(["plan", "-m", "llama3.1-8b", "--experts", "64", "--top-k", "4"])
+
+
+def test_vision_tower_not_in_expert_pool():
+    spec = {"total_b": 31.0, "active_b": 4.0, "vision_b": 1.0, "moe": True,
+            "n_experts": 128, "top_k": 8}
+    assert sf.streamed_params_b(spec, 100_000) == pytest.approx(30.0, rel=1e-3)
+
+
+@pytest.mark.parametrize("qc,expected", [
+    ({"quant_method": "fbgemm_fp8"}, "fp8"),
+    ({"quant_method": "gptq", "bits": 2}, "q2_k"),
+    ({"quant_method": "gptq", "bits": 6}, "q6_k"),
+])
+def test_detect_quant_more_formats(qc, expected):
+    assert sf._detect_quant({"quantization_config": qc}) == expected

@@ -217,7 +217,9 @@ def streamed_params_b(spec: dict, batch: int = 1) -> float:
     batch 1 a MoE streams only its active parameters, while a large batch streams
     close to the whole model. Without expert counts the active size is used.
     """
-    total, active = spec["total_b"], spec["active_b"]
+    # A vision tower (multimodal) is resident but not part of the expert pool.
+    total = spec["total_b"] - (spec.get("vision_b") or 0.0)
+    active = spec["active_b"]
     n_exp, top_k = spec.get("n_experts") or 0, spec.get("top_k") or 0
     if not (spec.get("moe") and n_exp > top_k > 0 and total > active):
         return active
@@ -325,7 +327,7 @@ def decode_tok_s(spec: dict, quant: str, context: int, batch: int = 1,
     agg = batch / step_s                   # aggregate tokens/s across the batch
     per = agg / batch if batch else 0.0    # tokens/s seen by one stream
     return {"aggregate": agg, "per_stream": per, "bytes_per_step": bytes_per_step,
-            "step_ms": step_s * 1000.0}
+            "step_time_ms": step_s * 1000.0}
 
 
 def prefill_flops(spec: dict, prompt_tokens: int) -> float:
@@ -450,6 +452,9 @@ def render_prefill(pf: dict) -> None:
 
 def resolve_model(args: argparse.Namespace) -> dict:
     """Resolve a model spec from --model (DB id) or custom --params/... flags."""
+    if args.model and (args.experts or args.top_k):
+        raise SystemExit("--experts/--top-k apply to a custom model (--params ...), "
+                         "not to --model.")
     if args.model and args.model in MODELS:
         spec = dict(MODELS[args.model])
         spec["name"] = args.model
@@ -468,9 +473,14 @@ def resolve_model(args: argparse.Namespace) -> dict:
             "kv_heads": args.kv_heads, "head_dim": args.head_dim,
             "moe": args.active is not None and args.active < args.params,
         }
-        if spec["moe"] and args.experts and args.top_k:
-            if not args.experts > args.top_k > 0:
-                raise SystemExit("--experts must be greater than --top-k (both >= 1).")
+        if args.experts or args.top_k:
+            if not (args.experts and args.top_k):
+                raise SystemExit("--experts and --top-k go together.")
+            if not spec["moe"]:
+                raise SystemExit("--experts/--top-k describe a MoE: also pass --active "
+                                 "smaller than --params.")
+            if not args.experts > args.top_k:
+                raise SystemExit("--experts must be greater than --top-k.")
             spec["n_experts"] = args.experts
             spec["top_k"] = args.top_k
     return spec
@@ -662,7 +672,7 @@ def _detect_quant(cfg: dict) -> "str | None":
         return "mxfp4"
     if method == "nvfp4" or "nvfp4" in algo or "nvfp4" in fmt:
         return "nvfp4"
-    if method == "fp8" or algo.startswith("fp8"):
+    if method in ("fp8", "fbgemm_fp8") or algo.startswith("fp8"):
         return "fp8"
     bits = qc.get("bits") or qc.get("w_bit") or qc.get("wbits")
     # compressed-tensors nests the width under config_groups[*].weights.num_bits
@@ -679,7 +689,8 @@ def _detect_quant(cfg: dict) -> "str | None":
                 break
     if bits:
         try:
-            return {8: "int8", 4: "q4_0", 3: "q3_k_m"}.get(int(bits))
+            return {8: "int8", 6: "q6_k", 5: "q5_0", 4: "q4_0", 3: "q3_k_m",
+                    2: "q2_k"}.get(int(bits))
         except (ValueError, TypeError):
             return None
     if method in ("gptq", "awq"):
@@ -793,6 +804,8 @@ def parse_hf_config(cfg: dict) -> dict:
     if moe:
         spec["n_experts"] = n_exp
         spec["top_k"] = top
+    if vision:
+        spec["vision_b"] = vision / 1e9
     if kv_style == "mla":
         spec["kv_style"] = "mla"
         spec["mla_dim"] = mla_dim
@@ -1283,9 +1296,10 @@ def split_serve_token(token: str) -> "tuple[str, str | None, str | None]":
 
     The model part may itself contain ':' (a URL, or a Windows path such as
     C:\\models\\x), so suffixes are peeled from the right and never past a drive
-    letter or an existing path.
+    letter, an existing path, or a piece containing a path separator (the
+    '//host/...' of a URL), so https://huggingface.co/org/m:fp8 also works.
     """
-    if "://" in token or os.path.exists(token):
+    if os.path.exists(token):
         return token, None, None
     head = token
     suffixes: list = []
@@ -1293,7 +1307,7 @@ def split_serve_token(token: str) -> "tuple[str, str | None, str | None]":
         if os.path.exists(head):
             break
         base, sep, tail = head.rpartition(":")
-        if not sep or re.fullmatch(r"[A-Za-z]", base):
+        if not sep or re.fullmatch(r"[A-Za-z]", base) or "/" in tail or "\\" in tail:
             break
         suffixes.insert(0, tail)
         head = base
@@ -1328,7 +1342,8 @@ def cmd_serve(args: argparse.Namespace) -> None:
         if ctx < 1:
             raise SystemExit(f"Context must be >= 1 (in '{token}').")
         spec = resolve_target(name)
-        quant = q or spec.get("detected_quant") or args.quant
+        # per-model suffix > explicit -q > quant declared by the model's config > default
+        quant = q or args.quant or spec.get("detected_quant") or DEFAULT_QUANT
         wgb = spec.get("weights_gb")
         w = wgb * GB if wgb else weight_bytes(spec["total_b"], quant)
         kv = kv_total_bytes(spec, ctx, streams, args.kv_dtype)
@@ -1544,6 +1559,9 @@ def _doctor_calibrate(args: argparse.Namespace, band: float) -> None:
                 "overhead allows; lower --step-overhead-ms.")
         eff = bytes_step / (band * 1e9 * stream_s)
         updates["efficiency"] = round(min(eff, 1.0), 3)  # never persist an efficiency > 1.0
+        # The efficiency only reproduces the measurement with the overhead it was
+        # backed out with, so persist the two together.
+        updates["step_ms"] = args.step_overhead_ms
         out.update({"calibrated_efficiency": round(eff, 3), "measured_tok_s": tok_s,
                     "step_overhead_ms": args.step_overhead_ms})
         lines.append(f"  measured {tok_s:.1f} tok/s on ~{bytes_step / GB:.1f} GB per step "
@@ -1620,8 +1638,9 @@ def cmd_doctor(args: argparse.Namespace) -> None:
 
     if args.engine:
         eff = ENGINE_EFFICIENCY[args.engine]
-        step_ms = ENGINE_STEP_OVERHEAD_MS[args.engine]
-        saved = (write_config({"efficiency": eff, "step_ms": step_ms})
+        step_ms = (args.step_overhead_ms if args.step_overhead_explicit
+                   else ENGINE_STEP_OVERHEAD_MS[args.engine])
+        saved =(write_config({"efficiency": eff, "step_ms": step_ms})
                  if args.save else None)
         if args.json:
             print(json.dumps({"engine": args.engine, "efficiency": eff,
@@ -1643,6 +1662,8 @@ def cmd_doctor(args: argparse.Namespace) -> None:
     # default: report device + effective settings + how to calibrate
     info = read_live_mem()
     settings = _effective_settings()
+    settings["bandwidth"] = band                      # a --bandwidth flag wins
+    settings["step_ms"] = args.step_overhead_ms       # flag > env > config > default
     if args.json:
         print(json.dumps({"device": info, "settings": settings,
                           "config_path": config_path(),
@@ -1789,7 +1810,9 @@ def build_parser() -> argparse.ArgumentParser:
                     help="model specs NAME[:quant[:context]]; NAME is a catalog id, "
                          "Hugging Face id or local path (e.g. deepseek-r1:fp8:8192)")
     add_workload_flags(sv)
-    sv.set_defaults(func=cmd_serve)
+    # No fixed quant default: an explicit -q wins over the detected one, which wins
+    # over q4_k_m (as in cluster).
+    sv.set_defaults(func=cmd_serve, quant=None)
 
     cl = sub.add_parser("cluster",
                         help="plan one model across several Spark nodes (combined memory + fabric)")
@@ -1902,6 +1925,28 @@ def _check_range(args: argparse.Namespace, attr: str, flag: str, *, low: float =
         raise SystemExit(f"{flag} must be {rng}, got {val:g}.")
 
 
+def resolve_engine_defaults(args: argparse.Namespace) -> None:
+    """Fill --efficiency / --step-overhead-ms left unset on the command line.
+
+    Precedence: explicit flag > SPARKFIT_* variable > config file (e.g. a value
+    calibrated by `doctor`) > --engine preset > built-in default. A calibration of
+    your own device is more specific than a generic engine preset, so --engine never
+    replaces it. `step_overhead_explicit` records whether the flag was given.
+    """
+    eng = getattr(args, "engine", None)
+    if hasattr(args, "efficiency") and args.efficiency is None:
+        args.efficiency = _envf("SPARKFIT_EFFICIENCY", None)
+        if args.efficiency is None:
+            args.efficiency = ENGINE_EFFICIENCY[eng] if eng else BW_EFFICIENCY
+    if hasattr(args, "step_overhead_ms"):
+        args.step_overhead_explicit = args.step_overhead_ms is not None
+        if args.step_overhead_ms is None:
+            args.step_overhead_ms = _envf("SPARKFIT_STEP_MS", None)
+        if args.step_overhead_ms is None:
+            args.step_overhead_ms = (ENGINE_STEP_OVERHEAD_MS[eng] if eng
+                                     else DEFAULT_STEP_OVERHEAD_MS)
+
+
 def validate_args(args: argparse.Namespace) -> None:
     """Validate the numeric knobs shared by the subcommands (after defaults resolve)."""
     _check_range(args, "efficiency", "--efficiency (or SPARKFIT_EFFICIENCY)", high=1.0)
@@ -1916,6 +1961,17 @@ def validate_args(args: argparse.Namespace) -> None:
                  inclusive_low=True)
     _check_range(args, "fabric_gbps", "--fabric-gbps")
     _check_range(args, "scaling", "--scaling", high=1.0, inclusive_low=True)
+    # Subcommands without these flags (doctor) still read them from the environment
+    # or the config file, so check those values too.
+    env_only = argparse.Namespace(
+        efficiency=_envf("SPARKFIT_EFFICIENCY", None), mfu=_envf("SPARKFIT_MFU", None),
+        step_overhead_ms=_envf("SPARKFIT_STEP_MS", None))
+    if not hasattr(args, "efficiency"):
+        _check_range(env_only, "efficiency", "SPARKFIT_EFFICIENCY", high=1.0)
+    if not hasattr(args, "mfu"):
+        _check_range(env_only, "mfu", "SPARKFIT_MFU", high=1.0)
+    if not hasattr(args, "step_overhead_ms"):
+        _check_range(env_only, "step_overhead_ms", "SPARKFIT_STEP_MS", inclusive_low=True)
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -1932,13 +1988,7 @@ def main(argv: list[str] | None = None) -> None:
     if argv[0] not in known:
         argv = ["quick"] + argv
     args = build_parser().parse_args(argv)
-    if hasattr(args, "efficiency") and args.efficiency is None:
-        eng = getattr(args, "engine", None)
-        args.efficiency = ENGINE_EFFICIENCY[eng] if eng else _envf("SPARKFIT_EFFICIENCY", BW_EFFICIENCY)
-    if hasattr(args, "step_overhead_ms") and args.step_overhead_ms is None:
-        eng = getattr(args, "engine", None)
-        args.step_overhead_ms = (ENGINE_STEP_OVERHEAD_MS[eng] if eng
-                                 else _envf("SPARKFIT_STEP_MS", DEFAULT_STEP_OVERHEAD_MS))
+    resolve_engine_defaults(args)
     validate_args(args)
     args.func(args)
 

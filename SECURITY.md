@@ -21,6 +21,13 @@ Please include enough detail to reproduce the problem. You can expect an initial
 response within a few days. Once a fix is available, we will publish it and credit
 the reporter unless anonymity is requested.
 
+## Automated scanning
+
+The code and the GitHub workflows are analyzed with
+[CodeQL](https://codeql.github.com/) (`security-extended` queries) on every push and
+pull request to `main` and `release/**`, and weekly. Findings appear in the
+repository's Security tab.
+
 ## Scope notes
 
 sparkfit performs local computation only. The single network feature is the
