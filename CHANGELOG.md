@@ -7,6 +7,17 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- MoE batched decode models expert coverage: with B tokens per step, a model with E
+  routed experts and top-k routing reads about `E * (1 - (1 - k/E)^B)` distinct
+  experts, not just the active parameters. Batched MoE throughput was previously
+  overstated several-fold (gpt-oss-120b at 64 streams: ~2,900 tok/s estimated
+  before, ~260 now, versus ~350-700 measured depending on how it is counted).
+  Built-in MoE models carry `n_experts`/`top_k`, Hugging Face configs provide
+  them, and custom models take `--experts` and `--top-k`.
+- `doctor --measured-ttft SECONDS` (with `--model`, `--prompt-tokens`, `--engine`)
+  backs out the prefill MFU from a measured time-to-first-token and can save it.
+  It can be combined with `--measured-tok-s` in one run, and refuses to save an
+  MFU measured at the weight-read bandwidth floor.
 - Quantization auto-detect now recognizes the Blackwell-native 4-bit formats: MXFP4
   (`quant_method: "mxfp4"`, as shipped by gpt-oss) and NVFP4 (ModelOpt `quant_algo`,
   and compressed-tensors 4-bit float weights). ModelOpt FP8 is detected too.
@@ -17,6 +28,14 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (`"capped": true` in JSON, `256+` in text).
 
 ### Changed
+- Prefill roofline recalibrated to measured GB10 compute: dense BF16 base 100
+  TFLOPS (was the ~125 theoretical), FP4 speedup 3.5x (was 4x), no precision
+  speedup on engines that dequantize (`--engine llama.cpp`/`ollama`), and half
+  the MFU for MoE grouped GEMMs. Prefill was overstated up to ~7x for MoE models
+  (gpt-oss-120b on llama.cpp: ~12,600 tok/s estimated before, ~1,400 now, ~1,700
+  measured).
+- A measured `--weights-gb` (or local model size) for a MoE now contributes only
+  its streamed share to decode, instead of the whole model per step.
 - `cluster` and `doctor` default to the quantization detected from the model's
   config (as `quick` and `serve` already did), falling back to `q4_k_m`.
 - `cluster` caps the fabric factor at the 200 Gb/s reference, so N nodes never

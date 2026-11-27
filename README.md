@@ -244,8 +244,26 @@ tok_s_per_stream  = tok_s_aggregate / streams
 
 Defaults: `bandwidth` 273 GB/s, `eff` 0.70. Weights are read once per step but the
 KV-cache is read for all streams, so adding concurrency raises aggregate
-throughput while each stream gets slower. For MoE only the active parameters are
-read, which is why a large MoE can be far faster than its total size suggests.
+throughput while each stream gets slower.
+
+For a Mixture-of-Experts, `active_weights` is what the batch actually touches. A
+single stream reads only its active parameters, which is why a large MoE can be far
+faster than its total size suggests. With many streams, different tokens are
+routed to different experts, so each step reads the always-on part (attention,
+embeddings, shared experts) plus every expert picked by at least one token. With E
+routed experts, top-k routing and B tokens per step:
+
+```
+experts_touched  = E * (1 - (1 - k/E)^B)
+active_weights   = always_on + experts_touched * params_per_expert
+```
+
+For gpt-oss-120b (128 experts, top-4), 64 concurrent streams already touch about
+87% of the experts, so batched MoE serving is much closer to a dense model of the
+same total size than single-stream decode suggests. This assumes uniform routing;
+real routing skew touches somewhat fewer experts. Built-in MoE models carry their
+expert counts, Hugging Face configs provide them, and for a custom model pass
+`--experts` and `--top-k`.
 
 Prefill (processing the prompt) is instead compute-bound for long prompts and
 bandwidth-bound (stream the weights once) for short ones, so the time to first
@@ -253,14 +271,24 @@ token is modeled as `max(compute_time, memory_time)`:
 
 ```
 compute_time = (2 * active_params * prompt + 2 * layers * prompt^2 * hidden)
-               / (peak_tflops * precision_mult * mfu)
+               / (bf16_tflops * precision_mult * moe_factor * mfu)
 memory_time  = weights_bytes / (bandwidth * eff)
 ttft         = max(compute_time, memory_time)
 ```
 
-`precision_mult` is 2 for fp8 and 4 for fp4 (native low-precision matmul), 1
-otherwise; `mfu` (default 0.30) and `peak_tflops` are calibratable with `--mfu`
-and `--compute-tflops`. Set `--prompt-tokens` to size the prompt.
+- `bf16_tflops` is 100, the dense BF16 matmul throughput measured on GB10
+  (MAMF/GEMM benchmarks report about 99 to 100 TFLOPS, below the ~125 theoretical).
+- `precision_mult` is 2 for fp8 and 3.5 for fp4 (measured: about 200 and 350
+  TFLOPS), and 1 otherwise. It is also 1 with `--engine llama.cpp` or `ollama`,
+  which dequantize weights and compute in 16-bit.
+- `moe_factor` is 0.5 for MoE models, whose prefill runs many small per-expert
+  GEMMs that reach a lower fraction of peak than one large dense GEMM.
+- `mfu` defaults to 0.30.
+
+With these defaults, gpt-oss-120b on llama.cpp prefills about 1,400 tokens/s,
+against about 1,700 measured on GB10. Calibrate `mfu` from your own measurement
+with `sparkfit doctor --measured-ttft` (see below), or set it with `--mfu`;
+`--compute-tflops` overrides the BF16 base and `--prompt-tokens` sizes the prompt.
 
 ### Reserves and parameter estimation
 
@@ -300,6 +328,17 @@ decode tok/s, and let `sparkfit doctor` do the arithmetic and save it:
 sparkfit doctor --measured-tok-s 6.8 --weights-gb 35.9 --save   # -> efficiency ~0.89
 sparkfit doctor --engine vllm --save                            # or start from a preset
 ```
+
+Prefill is calibrated the same way from a measured time-to-first-token. Use a long
+prompt, so the measurement is compute-bound rather than limited by reading the
+weights once; `doctor` refuses to save an MFU taken at that bandwidth floor:
+
+```bash
+sparkfit doctor --measured-ttft 4.2 -m llama3.1-8b -q fp8 --engine vllm \
+  --prompt-tokens 16384 --save                                  # -> prefill MFU ~0.40
+```
+
+Both measurements can be passed in one run.
 
 `doctor` writes the value to `~/.sparkfitrc` (override with `$SPARKFIT_CONFIG`), which
 every command reads as a default. Precedence is flag > environment variable > config

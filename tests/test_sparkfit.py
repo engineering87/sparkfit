@@ -538,7 +538,7 @@ def test_no_quant_config_leaves_detection_none(tmp_path, capsys):
 
 def test_compute_mult_mapping():
     assert sf._compute_mult("fp8") == 2.0
-    assert sf._compute_mult("nvfp4") == 4.0
+    assert sf._compute_mult("nvfp4") == 3.5  # measured NVFP4 GEMM ~347 vs BF16 ~100 TFLOPS
     assert sf._compute_mult("q4_k_m") == 1.0  # GGUF dequantizes to fp16 for compute
 
 
@@ -1069,3 +1069,131 @@ def test_config_file_reread_each_run(tmp_path, capsys, monkeypatch):
 
 def test_version_is_060():
     assert sf.__version__ == "0.6.0"
+
+
+# --- v0.6.0: MoE batched decode and recalibrated prefill ---
+
+def test_streamed_params_dense_is_constant():
+    spec = sf.MODELS["llama3.1-70b"]
+    assert sf.streamed_params_b(spec, 1) == spec["active_b"]
+    assert sf.streamed_params_b(spec, 64) == spec["active_b"]
+
+
+def test_streamed_params_moe_grows_with_batch():
+    spec = sf.MODELS["gpt-oss-120b"]  # 128 experts, top-4
+    one = sf.streamed_params_b(spec, 1)
+    big = sf.streamed_params_b(spec, 64)
+    assert one == pytest.approx(spec["active_b"])
+    # 64 tokens touch ~87% of the 128 experts: most of the model is read per step
+    assert 0.8 * spec["total_b"] < big <= spec["total_b"]
+    assert sf.streamed_params_b(spec, 10_000) == pytest.approx(spec["total_b"], rel=1e-3)
+
+
+def test_streamed_params_moe_without_expert_counts_falls_back():
+    spec = dict(sf.MODELS["gpt-oss-120b"])
+    del spec["n_experts"], spec["top_k"]
+    assert sf.streamed_params_b(spec, 64) == spec["active_b"]
+
+
+def test_moe_batched_aggregate_no_longer_scales_linearly():
+    spec = sf.MODELS["gpt-oss-120b"]
+    one = sf.decode_tok_s(spec, "mxfp4", 512, 1, efficiency=0.85)["aggregate"]
+    many = sf.decode_tok_s(spec, "mxfp4", 512, 64, efficiency=0.85)["aggregate"]
+    assert many < 10 * one  # was ~60x when only the active experts were counted
+
+
+def test_builtin_moe_models_have_expert_counts():
+    for name, s in sf.MODELS.items():
+        if s.get("moe"):
+            assert s["n_experts"] > s["top_k"] > 0, name
+
+
+def test_parse_hf_config_records_experts():
+    cfg = {"hidden_size": 2880, "num_hidden_layers": 36, "num_attention_heads": 64,
+           "num_key_value_heads": 8, "head_dim": 64, "intermediate_size": 2880,
+           "num_local_experts": 128, "num_experts_per_tok": 4, "vocab_size": 201088}
+    spec = sf.parse_hf_config(cfg)
+    assert spec["n_experts"] == 128 and spec["top_k"] == 4
+
+
+def test_custom_moe_expert_flags(capsys):
+    import json
+    base = ["plan", "--params", "100", "--active", "10", "-q", "q4_k_m", "-n", "32", "--json"]
+    sf.main(base)
+    no_experts = json.loads(capsys.readouterr().out)["decode_tok_s"]["aggregate"]
+    sf.main(base + ["--experts", "64", "--top-k", "4"])
+    with_experts = json.loads(capsys.readouterr().out)["decode_tok_s"]["aggregate"]
+    assert with_experts < no_experts
+    with pytest.raises(SystemExit):
+        sf.main(base + ["--experts", "4", "--top-k", "4"])
+
+
+def test_measured_moe_weights_scale_with_streamed_share():
+    spec = sf.MODELS["gpt-oss-120b"]
+    full = 65.0  # GB on disk for the whole model
+    b1 = sf.streamed_weight_bytes(spec, "mxfp4", 1, full)
+    assert b1 == pytest.approx(full * sf.GB * spec["active_b"] / spec["total_b"])
+
+
+def test_prefill_engine_dequant_removes_precision_speedup():
+    spec = sf.MODELS["llama3.1-8b"]
+    native = sf.prefill_stats(spec, "fp8", 8192)["compute_s"]
+    llama_cpp = sf.prefill_stats(spec, "fp8", 8192, engine="llama.cpp")["compute_s"]
+    assert llama_cpp == pytest.approx(native * sf.FP8_COMPUTE_MULT)
+
+
+def test_prefill_moe_penalty():
+    dense = dict(sf.MODELS["llama3.1-8b"])
+    moe = dict(dense, moe=True)
+    a = sf.prefill_stats(dense, "fp16", 8192)["compute_s"]
+    b = sf.prefill_stats(moe, "fp16", 8192)["compute_s"]
+    assert b == pytest.approx(a / sf.MOE_PREFILL_MFU_FACTOR)
+
+
+def test_prefill_gpt_oss_120b_llama_cpp_close_to_measured():
+    # Published llama.cpp runs on GB10 report ~1.7k prefill tok/s for gpt-oss-120b.
+    pf = sf.prefill_stats(sf.MODELS["gpt-oss-120b"], "mxfp4", 2048, engine="llama.cpp")
+    tok_s = pf["prompt_tokens"] / pf["ttft_s"]
+    assert 1000 < tok_s < 3000
+
+
+def test_doctor_measured_ttft_backs_out_mfu(capsys):
+    spec = sf.MODELS["llama3.1-8b"]
+    target_mfu = 0.42
+    flops = sf.prefill_flops(spec, 8192)
+    ceiling = sf.prefill_peak_flops(spec, "fp8", None, None, "vllm", apply_mfu=False)
+    ttft = flops / (ceiling * target_mfu)
+    d = _json_out(capsys, ["doctor", "--measured-ttft", f"{ttft:.6f}", "-m", "llama3.1-8b",
+                           "-q", "fp8", "--engine", "vllm", "--prompt-tokens", "8192", "--json"])
+    assert d["calibrated_mfu"] == pytest.approx(target_mfu, abs=0.005)
+    assert d["mfu_saved"] is True
+    assert "calibrated_efficiency" not in d
+
+
+def test_doctor_ttft_at_bandwidth_floor_not_saved(tmp_path, capsys, monkeypatch):
+    p = str(tmp_path / "rc")
+    monkeypatch.setenv("SPARKFIT_CONFIG", p)
+    d = _json_out(capsys, ["doctor", "--measured-ttft", "0.01", "-m", "llama3.1-70b",
+                           "-q", "fp8", "--prompt-tokens", "16", "--save", "--json"])
+    assert d["mfu_saved"] is False
+    assert "SPARKFIT_MFU" not in sf.load_config_file(p)
+
+
+def test_doctor_ttft_and_tok_s_together(tmp_path, capsys, monkeypatch):
+    p = str(tmp_path / "rc")
+    monkeypatch.setenv("SPARKFIT_CONFIG", p)
+    d = _json_out(capsys, ["doctor", "--measured-tok-s", "30", "--measured-ttft", "4",
+                           "-m", "llama3.1-8b", "-q", "fp8", "--prompt-tokens", "16384",
+                           "--save", "--json"])
+    cfg = sf.load_config_file(p)
+    assert "calibrated_efficiency" in d and "calibrated_mfu" in d
+    assert "SPARKFIT_EFFICIENCY" in cfg and "SPARKFIT_MFU" in cfg
+
+
+@pytest.mark.parametrize("argv", [
+    ["doctor", "--measured-ttft", "2"],                          # no model
+    ["doctor", "--measured-ttft", "-1", "-m", "llama3.1-8b"],    # non-positive
+])
+def test_doctor_measured_ttft_rejected(argv):
+    with pytest.raises(SystemExit):
+        sf.main(argv)

@@ -44,9 +44,22 @@ SPARK: dict = {
     "name": "NVIDIA DGX Spark (GB10)",
     "total_mem_gb": 128.0,      # advertised unified LPDDR5x
     "bandwidth_gbps": 273.0,    # 273 GB/s shared CPU+GPU, the real bottleneck
-    "fp4_tops": 1000.0,         # ~1 PFLOP FP4 (sparse)
-    "fp16_tflops": 125.0,       # approx dense BF16/FP16 compute (FP4 peak / 4)
+    "fp4_tops": 1000.0,         # ~1 PFLOP FP4 (sparse, marketing peak)
+    # Dense BF16 matmul throughput actually reached on GB10 (measured MAMF/GEMM
+    # benchmarks report ~99-100 TFLOPS; the theoretical figure is ~125).
+    "fp16_tflops": 100.0,
 }
+
+# Achievable dense matmul throughput of low-precision formats relative to BF16 on
+# GB10, from measured GEMM benchmarks (FP8 ~197-208 TFLOPS, NVFP4 ~347 TFLOPS).
+FP8_COMPUTE_MULT = 2.0
+FP4_COMPUTE_MULT = 3.5
+# Engines that dequantize to higher precision for matmuls (GGUF / llama.cpp kernels)
+# get no tensor-core speedup from low-precision weights during prefill.
+DEQUANT_ENGINES = ("llama.cpp", "ollama")
+# MoE prefill runs many small per-expert (grouped) GEMMs, which reach a lower
+# fraction of peak than one big dense GEMM: scale the MFU down for MoE models.
+MOE_PREFILL_MFU_FACTOR = 0.5
 
 # Default chunks of memory you cannot use for a model on a unified system.
 DEFAULT_OS_RESERVE_GB = 8.0     # DGX OS + Grace CPU side working set
@@ -91,25 +104,25 @@ MODELS: dict[str, dict] = {
     "llama3.1-70b":  dict(total_b=70.6,  active_b=70.6,  layers=80, hidden=8192,  kv_heads=8,  head_dim=128),
     "llama3.1-405b": dict(total_b=405.0, active_b=405.0, layers=126,hidden=16384, kv_heads=8,  head_dim=128),
     "mistral-7b":    dict(total_b=7.24,  active_b=7.24,  layers=32, hidden=4096,  kv_heads=8,  head_dim=128),
-    "mixtral-8x7b":  dict(total_b=46.7,  active_b=12.9,  layers=32, hidden=4096,  kv_heads=8,  head_dim=128, moe=True),
+    "mixtral-8x7b":  dict(total_b=46.7,  active_b=12.9,  layers=32, hidden=4096,  kv_heads=8,  head_dim=128, moe=True, n_experts=8, top_k=2),
     "qwen2.5-7b":    dict(total_b=7.6,   active_b=7.6,   layers=28, hidden=3584,  kv_heads=4,  head_dim=128),
     "qwen2.5-14b":   dict(total_b=14.7,  active_b=14.7,  layers=48, hidden=5120,  kv_heads=8,  head_dim=128),
     "qwen2.5-32b":   dict(total_b=32.5,  active_b=32.5,  layers=64, hidden=5120,  kv_heads=8,  head_dim=128),
     "qwen2.5-72b":   dict(total_b=72.7,  active_b=72.7,  layers=80, hidden=8192,  kv_heads=8,  head_dim=128),
     "gemma2-9b":     dict(total_b=9.24,  active_b=9.24,  layers=42, hidden=3584,  kv_heads=8,  head_dim=256),
     "gemma2-27b":    dict(total_b=27.2,  active_b=27.2,  layers=46, hidden=4608,  kv_heads=16, head_dim=128),
-    "gpt-oss-20b":   dict(total_b=21.0,  active_b=3.6,   layers=24, hidden=2880,  kv_heads=8,  head_dim=64,  moe=True),
-    "gpt-oss-120b":  dict(total_b=117.0, active_b=5.1,   layers=36, hidden=2880,  kv_heads=8,  head_dim=64,  moe=True),
-    "deepseek-v2-lite": dict(total_b=15.7,  active_b=2.4,  layers=27, hidden=2048, kv_heads=16,  head_dim=128, moe=True, kv_style="mla", mla_dim=576),
-    "deepseek-r1":      dict(total_b=671.0, active_b=37.0, layers=61, hidden=7168, kv_heads=128, head_dim=128, moe=True, kv_style="mla", mla_dim=576),
+    "gpt-oss-20b":   dict(total_b=21.0,  active_b=3.6,   layers=24, hidden=2880,  kv_heads=8,  head_dim=64,  moe=True, n_experts=32, top_k=4),
+    "gpt-oss-120b":  dict(total_b=117.0, active_b=5.1,   layers=36, hidden=2880,  kv_heads=8,  head_dim=64,  moe=True, n_experts=128, top_k=4),
+    "deepseek-v2-lite": dict(total_b=15.7,  active_b=2.4,  layers=27, hidden=2048, kv_heads=16,  head_dim=128, moe=True, n_experts=64, top_k=6, kv_style="mla", mla_dim=576),
+    "deepseek-r1":      dict(total_b=671.0, active_b=37.0, layers=61, hidden=7168, kv_heads=128, head_dim=128, moe=True, n_experts=256, top_k=8, kv_style="mla", mla_dim=576),
     "qwen3-8b":         dict(total_b=8.2,   active_b=8.2,   layers=36, hidden=4096,  kv_heads=8,   head_dim=128),
     "qwen3-14b":        dict(total_b=14.8,  active_b=14.8,  layers=40, hidden=5120,  kv_heads=8,   head_dim=128),
     "qwen3-32b":        dict(total_b=32.8,  active_b=32.8,  layers=64, hidden=5120,  kv_heads=8,   head_dim=128),
-    "qwen3-30b-a3b":    dict(total_b=30.5,  active_b=3.4,   layers=48, hidden=2048,  kv_heads=4,   head_dim=128, moe=True),
-    "qwen3-235b-a22b":  dict(total_b=235.1, active_b=22.2,  layers=94, hidden=4096,  kv_heads=4,   head_dim=128, moe=True),
+    "qwen3-30b-a3b":    dict(total_b=30.5,  active_b=3.4,   layers=48, hidden=2048,  kv_heads=4,   head_dim=128, moe=True, n_experts=128, top_k=8),
+    "qwen3-235b-a22b":  dict(total_b=235.1, active_b=22.2,  layers=94, hidden=4096,  kv_heads=4,   head_dim=128, moe=True, n_experts=128, top_k=8),
     "mistral-small-24b":dict(total_b=23.6,  active_b=23.6,  layers=40, hidden=5120,  kv_heads=8,   head_dim=128),
     "phi-4":            dict(total_b=14.7,  active_b=14.7,  layers=40, hidden=5120,  kv_heads=10,  head_dim=128),
-    "deepseek-v3":      dict(total_b=671.0, active_b=37.6,  layers=61, hidden=7168,  kv_heads=128, head_dim=128, moe=True, kv_style="mla", mla_dim=576),
+    "deepseek-v3":      dict(total_b=671.0, active_b=37.6,  layers=61, hidden=7168,  kv_heads=128, head_dim=128, moe=True, n_experts=256, top_k=8, kv_style="mla", mla_dim=576),
 }
 
 # ---------------------------------------------------------------------------
@@ -171,16 +184,42 @@ def weight_bytes(params_b: float, quant: str) -> float:
     return params_b * 1e9 * quant_bits(quant) / 8.0
 
 
-def _compute_mult(quant: str) -> float:
-    """Relative matmul throughput of a weight precision on Blackwell tensor cores.
-    Only formats with native low-precision matmul (fp8, fp4) run faster; GGUF-style
-    quants dequantize to fp16 for compute, so they get no prefill speedup."""
+def _compute_mult(quant: str, engine: "str | None" = None) -> float:
+    """Relative matmul throughput of a weight precision on GB10 tensor cores.
+
+    Only formats with native low-precision matmul (fp8, fp4) run faster, and only
+    on engines that use those kernels; GGUF-style quants, and engines that
+    dequantize (llama.cpp, ollama), compute in 16-bit and get no prefill speedup.
+    """
+    if engine in DEQUANT_ENGINES:
+        return 1.0
     q = quant.lower()
     if q in ("fp8", "int8"):
-        return 2.0
+        return FP8_COMPUTE_MULT
     if q in ("nvfp4", "fp4", "mxfp4"):
-        return 4.0
+        return FP4_COMPUTE_MULT
     return 1.0
+
+
+def streamed_params_b(spec: dict, batch: int = 1) -> float:
+    """Billions of weights read from memory per decode step for `batch` streams.
+
+    A dense model reads every weight once per step whatever the batch. A
+    Mixture-of-Experts reads its always-on part (attention, embeddings, shared
+    experts) plus every routed expert that at least one token in the batch picked:
+    with E experts, top-k routing and B tokens, about E * (1 - (1 - k/E)^B) distinct
+    experts per layer (uniform routing; real routing skew touches a few less). So at
+    batch 1 a MoE streams only its active parameters, while a large batch streams
+    close to the whole model. Without expert counts the active size is used.
+    """
+    total, active = spec["total_b"], spec["active_b"]
+    n_exp, top_k = spec.get("n_experts") or 0, spec.get("top_k") or 0
+    if not (spec.get("moe") and n_exp > top_k > 0 and total > active):
+        return active
+    per_expert = (total - active) / (n_exp - top_k)   # params of one routed expert (all layers)
+    always_on = active - top_k * per_expert
+    touched = n_exp * (1.0 - (1.0 - top_k / n_exp) ** max(int(batch), 1))
+    return min(always_on + touched * per_expert, total)
 
 
 def kv_per_token_bytes(spec: dict, kv_dtype: str = "fp16") -> float:
@@ -243,19 +282,32 @@ def budget(spec: dict, quant: str, context: int, batch: int, concurrency: int = 
     }
 
 
+def streamed_weight_bytes(spec: dict, quant: str, batch: int = 1,
+                          weights_gb: "float | None" = None) -> float:
+    """Bytes of weights read per decode step (see `streamed_params_b`)."""
+    params = streamed_params_b(spec, batch)
+    if weights_gb and weights_gb > 0:
+        total = spec["total_b"]
+        return weights_gb * GB * (params / total if total > 0 else 1.0)
+    return weight_bytes(params, quant)
+
+
 def decode_tok_s(spec: dict, quant: str, context: int, batch: int = 1,
                  kv_dtype: str = "fp16", bandwidth: float | None = None,
                  efficiency: float = BW_EFFICIENCY,
                  weights_gb: float | None = None) -> dict:
     """Memory-bandwidth roofline for decode (token generation) speed.
 
-    Decode is memory-bound: each step streams the (active) weights once plus the
+    Decode is memory-bound: each step streams the weights the batch needs once (for
+    a MoE, the experts its tokens were routed to, see `streamed_params_b`) plus the
     whole KV-cache. This is exactly why Spark's 273 GB/s caps tok/s.
+    `weights_gb` is the measured size of the whole model; the streamed share of it
+    is taken in proportion to the parameters read.
     """
     band = bandwidth if (bandwidth and bandwidth > 0) else SPARK["bandwidth_gbps"]
     eff = efficiency if (efficiency and efficiency > 0) else BW_EFFICIENCY
     bw = band * 1e9 * eff
-    w_active = weights_gb * GB if (weights_gb and weights_gb > 0) else weight_bytes(spec["active_b"], quant)
+    w_active = streamed_weight_bytes(spec, quant, batch, weights_gb)
     kv_step = kv_per_token_bytes(spec, kv_dtype) * effective_context(spec, context) * batch
     bytes_per_step = max(w_active + kv_step, 1.0)
     agg = batch * bw / bytes_per_step      # aggregate tokens/s across the batch
@@ -263,25 +315,44 @@ def decode_tok_s(spec: dict, quant: str, context: int, batch: int = 1,
     return {"aggregate": agg, "per_stream": per, "bytes_per_step": bytes_per_step}
 
 
+def prefill_flops(spec: dict, prompt_tokens: int) -> float:
+    """FLOPs to prefill a prompt: 2 per active weight per token plus attention."""
+    t = max(int(prompt_tokens), 1)
+    return 2 * spec["active_b"] * 1e9 * t + 2 * spec["layers"] * t * t * spec["hidden"]
+
+
+def prefill_peak_flops(spec: dict, quant: str, tflops: "float | None" = None,
+                       mfu: "float | None" = DEFAULT_MFU,
+                       engine: "str | None" = None, apply_mfu: bool = True) -> float:
+    """Effective FLOP/s for prefill. With apply_mfu=False, the ceiling before MFU
+    (used by `doctor` to back the MFU out of a measured time-to-first-token)."""
+    tf = tflops if (tflops and tflops > 0) else SPARK["fp16_tflops"]
+    peak = tf * 1e12 * _compute_mult(quant, engine)
+    if spec.get("moe"):
+        peak *= MOE_PREFILL_MFU_FACTOR
+    if apply_mfu:
+        peak *= mfu if (mfu and mfu > 0) else DEFAULT_MFU
+    return peak
+
+
 def prefill_stats(spec: dict, quant: str, prompt_tokens: int,
                   bandwidth: float | None = None, efficiency: float = BW_EFFICIENCY,
                   tflops: float | None = None, mfu: float = DEFAULT_MFU,
-                  weights_gb: float | None = None) -> dict:
+                  weights_gb: float | None = None, engine: "str | None" = None) -> dict:
     """Prefill / time-to-first-token roofline: max(compute-bound, bandwidth-bound).
 
     Prefill processes the whole prompt in one shot, so it is compute-bound for long
     prompts and bandwidth-bound (stream the weights once) for short ones. FLOPs use
     the active parameters plus the quadratic attention term; the memory floor is a
-    single read of the resident weights.
+    single read of the resident weights. The compute side uses the dense BF16
+    throughput actually reached on GB10, a precision speedup only where the engine
+    runs native fp8/fp4 matmuls, and a lower utilization for MoE grouped GEMMs.
     """
     band = bandwidth if (bandwidth and bandwidth > 0) else SPARK["bandwidth_gbps"]
     eff = efficiency if (efficiency and efficiency > 0) else BW_EFFICIENCY
-    tf = tflops if (tflops and tflops > 0) else SPARK["fp16_tflops"]
-    mf = mfu if (mfu and mfu > 0) else DEFAULT_MFU
     t = max(int(prompt_tokens), 1)
-    peak = tf * 1e12 * _compute_mult(quant) * mf
-    flops = 2 * spec["active_b"] * 1e9 * t + 2 * spec["layers"] * t * t * spec["hidden"]
-    compute_s = flops / peak
+    flops = prefill_flops(spec, t)
+    compute_s = flops / prefill_peak_flops(spec, quant, tflops, mfu, engine)
     mem_bytes = (weights_gb * GB if (weights_gb and weights_gb > 0)
                  else weight_bytes(spec["total_b"], quant))
     memory_s = mem_bytes / (band * 1e9 * eff)
@@ -384,6 +455,11 @@ def resolve_model(args: argparse.Namespace) -> dict:
             "kv_heads": args.kv_heads, "head_dim": args.head_dim,
             "moe": args.active is not None and args.active < args.params,
         }
+        if spec["moe"] and args.experts and args.top_k:
+            if not args.experts > args.top_k > 0:
+                raise SystemExit("--experts must be greater than --top-k (both >= 1).")
+            spec["n_experts"] = args.experts
+            spec["top_k"] = args.top_k
     return spec
 
 
@@ -392,6 +468,10 @@ def add_model_flags(p: argparse.ArgumentParser) -> None:
     p.add_argument("-m", "--model", help="model id from the built-in DB (see `sparkfit models`)")
     p.add_argument("--params", type=float, help="custom: total params (billions)")
     p.add_argument("--active", type=float, help="custom: active params for MoE (billions)")
+    p.add_argument("--experts", type=_positive_int, default=None,
+                   help="custom MoE: routed experts per layer (for batched decode)")
+    p.add_argument("--top-k", type=_positive_int, default=None,
+                   help="custom MoE: experts each token is routed to")
     p.add_argument("--layers", type=int, default=32, help="custom: number of layers")
     p.add_argument("--hidden", type=int, default=4096, help="custom: hidden size")
     p.add_argument("--kv-heads", type=int, default=8, help="custom: KV heads (GQA)")
@@ -691,6 +771,9 @@ def parse_hf_config(cfg: dict) -> dict:
     spec = {"total_b": total / 1e9, "active_b": active / 1e9, "layers": layers,
             "hidden": hidden, "kv_heads": kv_heads, "head_dim": head_dim,
             "kv_layers": kv_layers, "sliding_window": sliding_window, "moe": moe}
+    if moe:
+        spec["n_experts"] = n_exp
+        spec["top_k"] = top
     if kv_style == "mla":
         spec["kv_style"] = "mla"
         spec["mla_dim"] = mla_dim
@@ -914,7 +997,7 @@ def cmd_quick(args: argparse.Namespace) -> None:
 
     pf = prefill_stats(spec, compute_quant, args.prompt_tokens or ctx, args.bandwidth,
                        args.efficiency, args.compute_tflops, args.mfu,
-                       weights_gb=weights_gb)
+                       weights_gb=weights_gb, engine=args.engine)
 
     if args.json:
         print(json.dumps({
@@ -1002,7 +1085,7 @@ def cmd_plan(args: argparse.Namespace) -> None:
                       weights_gb=args.weights_gb)
     pf = prefill_stats(spec, args.quant, args.prompt_tokens or args.context,
                        args.bandwidth, args.efficiency, args.compute_tflops, args.mfu,
-                       weights_gb=args.weights_gb)
+                       weights_gb=args.weights_gb, engine=args.engine)
 
     if args.json:
         print(json.dumps({"model": spec, "quant": args.quant, "context": args.context,
@@ -1233,7 +1316,8 @@ def cmd_serve(args: argparse.Namespace) -> None:
         alone = decode_tok_s(spec, quant, ctx, streams, args.kv_dtype, args.bandwidth,
                              args.efficiency, weights_gb=wgb)["per_stream"]
         pf = prefill_stats(spec, quant, args.prompt_tokens or ctx, args.bandwidth,
-                           args.efficiency, args.compute_tflops, args.mfu, weights_gb=wgb)
+                           args.efficiency, args.compute_tflops, args.mfu, weights_gb=wgb,
+                           engine=args.engine)
         rows.append({"name": spec["name"], "quant": quant, "context": ctx,
                      "weights": w, "kv": kv, "act": act, "total": w + kv + act,
                      "alone": alone, "ttft": pf["ttft_s"]})
@@ -1400,54 +1484,107 @@ def _effective_settings() -> dict:
             "tflops": _envf("SPARKFIT_TFLOPS", SPARK["fp16_tflops"])}
 
 
+def _doctor_calibrate(args: argparse.Namespace, band: float) -> None:
+    """`doctor --measured-tok-s` and/or `--measured-ttft`: back out efficiency / MFU."""
+    tok_s, ttft = args.measured_tok_s, args.measured_ttft
+    if tok_s is not None and tok_s <= 0:
+        raise SystemExit("--measured-tok-s must be positive.")
+    if ttft is not None and ttft <= 0:
+        raise SystemExit("--measured-ttft must be a positive number of seconds.")
+    spec = resolve_target(args.model) if args.model else None
+    if ttft is not None and spec is None:
+        raise SystemExit("doctor --measured-ttft needs --model (its FLOPs depend on the "
+                         "architecture).")
+    wgb = args.weights_gb
+    if spec is not None and wgb is None:
+        wgb = spec.get("weights_gb")
+    quant = args.quant or (spec or {}).get("detected_quant") or DEFAULT_QUANT
+    out: dict = {}
+    updates: dict = {}
+    lines: list = []
+
+    eff = None
+    if tok_s is not None:
+        if spec is not None:
+            bytes_step = (streamed_weight_bytes(spec, quant, 1, wgb)
+                          + kv_per_token_bytes(spec, args.kv_dtype) * effective_context(spec, args.context))
+        elif wgb:
+            bytes_step = wgb * GB
+        else:
+            raise SystemExit("doctor --measured-tok-s needs --model or --weights-gb.")
+        eff = tok_s * bytes_step / (band * 1e9)
+        updates["efficiency"] = round(min(eff, 1.0), 3)  # never persist an efficiency > 1.0
+        out.update({"calibrated_efficiency": round(eff, 3), "measured_tok_s": tok_s})
+        lines.append(f"  measured {tok_s:.1f} tok/s on ~{bytes_step / GB:.1f} GB per step "
+                     f"at {band:.0f} GB/s")
+        lines.append("  -> bandwidth efficiency " + bold(f"{eff:.2f}")
+                     + dim(f"  (default is {BW_EFFICIENCY:.2f})"))
+        if eff > 1.0:
+            lines.append(yellow("  note: efficiency > 1.0 means the measurement beats the "
+                                "roofline; check the weight size and bandwidth."))
+
+    if ttft is not None and spec is not None:
+        prompt = args.prompt_tokens or args.context
+        flops = prefill_flops(spec, prompt)
+        ceiling = prefill_peak_flops(spec, quant, args.compute_tflops, None, args.engine,
+                                     apply_mfu=False)
+        bw_eff = eff if (eff and eff <= 1.0) else _envf("SPARKFIT_EFFICIENCY", BW_EFFICIENCY)
+        mem_bytes = wgb * GB if (wgb and wgb > 0) else weight_bytes(spec["total_b"], quant)
+        memory_s = mem_bytes / (band * 1e9 * (bw_eff or BW_EFFICIENCY))
+        mfu = flops / (ttft * ceiling)
+        out.update({"measured_ttft_s": ttft, "prompt_tokens": prompt,
+                    "calibrated_mfu": round(mfu, 3), "memory_floor_s": round(memory_s, 3)})
+        lines.append(f"  measured {ttft:.2f} s to first token for a {prompt} token prompt "
+                     f"({flops / 1e12:.1f} TFLOP at {quant}"
+                     + (f", {args.engine}" if args.engine else "") + ")")
+        if ttft <= memory_s * 1.1:
+            out["mfu_saved"] = False
+            lines.append(yellow(f"  note: {ttft:.2f} s is at the bandwidth floor (~{memory_s:.2f} s "
+                                "to read the weights), so it says little about compute; "
+                                "measure with a longer prompt. MFU not saved."))
+        elif mfu > 1.0:
+            out["mfu_saved"] = False
+            lines.append(yellow(f"  note: MFU {mfu:.2f} > 1.0 beats the compute ceiling; check "
+                                "--engine, --quant and the prompt length. MFU not saved."))
+        else:
+            updates["mfu"] = round(mfu, 3)
+            out["mfu_saved"] = True
+            lines.append("  -> prefill MFU " + bold(f"{mfu:.2f}")
+                         + dim(f"  (default is {DEFAULT_MFU:.2f})"))
+
+    saved = write_config(updates) if (args.save and updates) else None
+    if args.json:
+        out.update({"bandwidth_gbps": band, "saved_to": saved})
+        print(json.dumps(out, indent=2))
+        return
+    print()
+    print(bold("  sparkfit doctor  |  calibration"))
+    print()
+    for line in lines:
+        print(line)
+    print()
+    if saved:
+        print("  " + green(f"saved to {saved}"))
+    elif updates:
+        env = "  ".join(f"SPARKFIT_{k.upper()}={v}" for k, v in updates.items())
+        print(dim(f"  re-run with --save to write this to the config file, or set {env}"))
+    print()
+
+
 def cmd_doctor(args: argparse.Namespace) -> None:
     """Calibrate sparkfit to your device and optionally persist the settings.
 
     With a measured single-stream decode tok/s, back out the real bandwidth
     efficiency (decode is memory-bound, so eff = tok_s * bytes_per_step / bandwidth).
-    With --engine, start from a sensible per-engine efficiency. Otherwise, report the
-    device and the settings currently in effect.
+    With a measured time-to-first-token, back out the prefill MFU
+    (mfu = prefill_flops / (ttft * compute_ceiling)). With --engine alone, start from
+    a sensible per-engine efficiency. Otherwise, report the device and the settings
+    currently in effect.
     """
     band = args.bandwidth if (args.bandwidth and args.bandwidth > 0) else SPARK["bandwidth_gbps"]
 
-    if args.measured_tok_s is not None:
-        if args.measured_tok_s <= 0:
-            raise SystemExit("--measured-tok-s must be positive.")
-        if args.model:
-            spec = resolve_target(args.model)
-            wgb = args.weights_gb if args.weights_gb is not None else spec.get("weights_gb")
-            quant = args.quant or spec.get("detected_quant") or DEFAULT_QUANT
-            active = wgb * GB if (wgb and wgb > 0) else weight_bytes(spec["active_b"], quant)
-            bytes_step = active + kv_per_token_bytes(spec, args.kv_dtype) * effective_context(spec, args.context)
-        elif args.weights_gb:
-            bytes_step = args.weights_gb * GB
-        else:
-            raise SystemExit("doctor --measured-tok-s needs --model or --weights-gb.")
-        eff = args.measured_tok_s * bytes_step / (band * 1e9)
-        save_eff = round(min(eff, 1.0), 3)  # never persist an efficiency above 1.0
-        saved = write_config({"efficiency": save_eff}) if args.save else None
-        if args.json:
-            print(json.dumps({"calibrated_efficiency": round(eff, 3),
-                              "measured_tok_s": args.measured_tok_s,
-                              "bandwidth_gbps": band, "saved_to": saved}, indent=2))
-            return
-        print()
-        print(bold("  sparkfit doctor  |  calibration"))
-        print()
-        print(f"  measured {args.measured_tok_s:.1f} tok/s on ~{bytes_step / GB:.1f} GB per step "
-              f"at {band:.0f} GB/s")
-        print("  -> bandwidth efficiency " + bold(f"{eff:.2f}")
-              + dim(f"  (default is {BW_EFFICIENCY:.2f})"))
-        if eff > 1.0:
-            print(yellow("  note: efficiency > 1.0 means the measurement beats the roofline; "
-                         "check the weight size and bandwidth."))
-        print()
-        if saved:
-            print("  " + green(f"saved to {saved}"))
-        else:
-            print(dim("  re-run with --save to write this to the config file, or set "
-                      f"SPARKFIT_EFFICIENCY={eff:.2f}"))
-        print()
+    if args.measured_tok_s is not None or args.measured_ttft is not None:
+        _doctor_calibrate(args, band)
         return
 
     if args.engine:
@@ -1471,9 +1608,9 @@ def cmd_doctor(args: argparse.Namespace) -> None:
 
     # default: report device + effective settings + how to calibrate
     info = read_live_mem()
-    eff = _effective_settings()
+    settings = _effective_settings()
     if args.json:
-        print(json.dumps({"device": info, "settings": eff,
+        print(json.dumps({"device": info, "settings": settings,
                           "config_path": config_path(),
                           "config_exists": os.path.isfile(config_path())}, indent=2))
         return
@@ -1487,11 +1624,12 @@ def cmd_doctor(args: argparse.Namespace) -> None:
         print(dim("  device: no nvidia-smi / /proc/meminfo (not a Spark, or run it on the box)"))
     print()
     print(dim("  effective settings (flag > env > config > default):"))
-    print(f"    efficiency   {eff['efficiency']:.2f}")
-    print(f"    bandwidth    {eff['bandwidth']:.0f} GB/s")
-    print(f"    os reserve   {eff['os_reserve']:.0f} GB")
-    print(f"    framework    {eff['framework']:.0f} GB")
-    print(f"    mfu          {eff['mfu']:.2f}")
+    print(f"    efficiency   {settings['efficiency']:.2f}")
+    print(f"    bandwidth    {settings['bandwidth']:.0f} GB/s")
+    print(f"    os reserve   {settings['os_reserve']:.0f} GB")
+    print(f"    framework    {settings['framework']:.0f} GB")
+    print(f"    mfu          {settings['mfu']:.2f}")
+    print(f"    tflops       {settings['tflops']:.0f} (dense BF16)")
     print()
     cp = config_path()
     print(dim(f"  config: {cp} ({'loaded' if os.path.isfile(cp) else 'not found'})"))
@@ -1639,6 +1777,13 @@ def build_parser() -> argparse.ArgumentParser:
                         help="calibrate sparkfit to your device and save the settings")
     dr.add_argument("--measured-tok-s", type=float,
                     help="a measured single-stream decode tok/s to calibrate efficiency")
+    dr.add_argument("--measured-ttft", type=float,
+                    help="a measured time-to-first-token in seconds to calibrate the "
+                         "prefill MFU (needs --model; use a long prompt)")
+    dr.add_argument("--prompt-tokens", type=_positive_int, default=None,
+                    help="prompt length of the TTFT measurement (default: --context)")
+    dr.add_argument("--compute-tflops", type=float, default=_envf("SPARKFIT_TFLOPS", None),
+                    help="override dense BF16 compute in TFLOP/s")
     dr.add_argument("-m", "--model", help="model for the measured point (id / HF / local path)")
     dr.add_argument("--weights-gb", type=float, help="weight size in GB (if not using --model)")
     dr.add_argument("-q", "--quant", default=None,
@@ -1647,7 +1792,8 @@ def build_parser() -> argparse.ArgumentParser:
     dr.add_argument("--kv-dtype", default="fp16", choices=list(KV_BYTES))
     dr.add_argument("--bandwidth", type=float, default=_envf("SPARKFIT_BANDWIDTH", None))
     dr.add_argument("--engine", choices=list(ENGINE_EFFICIENCY),
-                    help="start from a per-engine efficiency default")
+                    help="alone: start from a per-engine efficiency default; with "
+                         "--measured-ttft: the engine that was measured")
     dr.add_argument("--save", action="store_true",
                     help="write the value to the config file (~/.sparkfitrc)")
     dr.add_argument("--json", action="store_true")
