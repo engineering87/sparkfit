@@ -116,8 +116,8 @@ MODELS: dict[str, dict] = {
     "qwen2.5-72b":   dict(total_b=72.7,  active_b=72.7,  layers=80, hidden=8192,  kv_heads=8,  head_dim=128),
     "gemma2-9b":     dict(total_b=9.24,  active_b=9.24,  layers=42, hidden=3584,  kv_heads=8,  head_dim=256),
     "gemma2-27b":    dict(total_b=27.2,  active_b=27.2,  layers=46, hidden=4608,  kv_heads=16, head_dim=128),
-    "gpt-oss-20b":   dict(total_b=21.0,  active_b=3.6,   layers=24, hidden=2880,  kv_heads=8,  head_dim=64,  moe=True, n_experts=32, top_k=4),
-    "gpt-oss-120b":  dict(total_b=117.0, active_b=5.1,   layers=36, hidden=2880,  kv_heads=8,  head_dim=64,  moe=True, n_experts=128, top_k=4),
+    "gpt-oss-20b":   dict(total_b=21.0,  active_b=3.6,   layers=24, hidden=2880,  kv_heads=8,  head_dim=64,  moe=True, n_experts=32, top_k=4, detected_quant="mxfp4"),
+    "gpt-oss-120b":  dict(total_b=117.0, active_b=5.1,   layers=36, hidden=2880,  kv_heads=8,  head_dim=64,  moe=True, n_experts=128, top_k=4, detected_quant="mxfp4"),
     "deepseek-v2-lite": dict(total_b=15.7,  active_b=2.4,  layers=27, hidden=2048, kv_heads=16,  head_dim=128, moe=True, n_experts=64, top_k=6, kv_style="mla", mla_dim=576),
     "deepseek-r1":      dict(total_b=671.0, active_b=37.0, layers=61, hidden=7168, kv_heads=128, head_dim=128, moe=True, n_experts=256, top_k=8, kv_style="mla", mla_dim=576),
     "qwen3-8b":         dict(total_b=8.2,   active_b=8.2,   layers=36, hidden=4096,  kv_heads=8,   head_dim=128),
@@ -1055,7 +1055,7 @@ def cmd_quick(args: argparse.Namespace) -> None:
     elif args.quant is not None:
         pick = "chosen"
     elif spec.get("detected_quant") and chosen == spec.get("detected_quant"):
-        pick = "detected"
+        pick = "native" if spec.get("source") in (None, "builtin") else "detected"
     else:
         pick = "auto"
     streams_suffix = f"  |  {conc} streams" if conc > 1 else ""

@@ -83,6 +83,11 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Security: CodeQL analysis (`security-extended` queries) of the Python code and of
   the GitHub workflows on every push and pull request to `main`/`release/**` and
   weekly, with a README badge.
+- CI dependencies updated: `actions/checkout@v7`, `actions/setup-python@v7`,
+  `actions/upload-artifact@v7`, `actions/download-artifact@v8` (Node 24; a hash
+  mismatch on download now fails the release), and dev tooling floors raised to
+  the tested versions (`pytest>=9`, `pytest-cov>=7`, `ruff>=0.17`, `mypy>=2`).
+  Dependabot now proposes weekly grouped updates for actions and dev tools.
 - Docs: the README covers `cluster`, quantization auto-detect, the `serve` spec
   format and option ranges, and fixes the calibration example (6.8 tok/s on
   35.9 GB is about 0.89 efficiency, not 0.85); SECURITY lists supported versions
@@ -100,6 +105,12 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `--step-overhead-ms` when given.
 - The config file is re-read on every run, so `$SPARKFIT_CONFIG` set after import
   takes effect; the test suite no longer depends on the developer's `~/.sparkfitrc`.
+- The built-in gpt-oss-20b and gpt-oss-120b default to their shipped MXFP4 format
+  in quick mode, `serve`, `cluster` and `doctor` (shown as `mxfp4 (native)`);
+  quick mode used to pick `q6_k` for gpt-oss-120b, about 96 GB instead of ~62 GB.
+- The PyPI project page shows the logo and demo (README images use absolute URLs),
+  and the source distribution includes `tests/conftest.py`, so its tests no longer
+  read the developer's `~/.sparkfitrc`.
 
 ### Removed
 - A stale copy of the source (`outputs_sparkfit_copy.py`) that had been committed

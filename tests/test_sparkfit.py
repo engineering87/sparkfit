@@ -526,6 +526,19 @@ def test_quick_explicit_quant_overrides_detected(tmp_path, capsys):
     assert out["chosen_quant"] == "q4_k_m"  # explicit -q wins
 
 
+def test_builtin_gpt_oss_defaults_to_native_mxfp4(capsys):
+    import json
+    sf.main(["gpt-oss-120b", "--json"])
+    out = json.loads(capsys.readouterr().out)
+    assert out["chosen_quant"] == "mxfp4"  # shipped format, not the ladder's q6_k
+    sf.main(["gpt-oss-120b"])
+    assert "mxfp4 (native)" in capsys.readouterr().out
+    sf.main(["serve", "gpt-oss-20b", "--json"])
+    assert json.loads(capsys.readouterr().out)["models"][0]["quant"] == "mxfp4"
+    sf.main(["gpt-oss-120b", "-q", "q4_k_m", "--json"])
+    assert json.loads(capsys.readouterr().out)["chosen_quant"] == "q4_k_m"
+
+
 def test_no_quant_config_leaves_detection_none(tmp_path, capsys):
     import json
     (tmp_path / "config.json").write_text(json.dumps({

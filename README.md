@@ -1,7 +1,7 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/logo-dark.svg">
-    <img alt="sparkfit" src="assets/logo.svg" width="360">
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/engineering87/sparkfit/main/assets/logo-dark.svg">
+    <img alt="sparkfit" src="https://raw.githubusercontent.com/engineering87/sparkfit/main/assets/logo.svg" width="360">
   </picture>
 </p>
 
@@ -86,7 +86,7 @@ sparkfit /models/my-model/config.json   # a local config.json (file or dir)
 ```
 
 <p align="center">
-  <img alt="sparkfit planning llama3.1-70b on a DGX Spark" src="assets/demo.svg" width="720">
+  <img alt="sparkfit planning llama3.1-70b on a DGX Spark" src="https://raw.githubusercontent.com/engineering87/sparkfit/main/assets/demo.svg" width="720">
 </p>
 
 Override any default: `sparkfit qwen2.5-72b -c 16384 -n 4 -q q5_k_m`.
@@ -168,8 +168,8 @@ scripting).
 ### Key flags
 
 `-q/--quant` (default `q4_k_m` for `plan`, `advise`, `fit`; for `serve`, `cluster`
-and `doctor` the quant detected from the model's config, else `q4_k_m`; auto in
-quick mode), `-c/--context`, `-b/--batch`, `-n/--concurrency`,
+and `doctor` the quant detected from the model's config, or the shipped MXFP4 of
+the built-in gpt-oss models, else `q4_k_m`; auto in quick mode), `-c/--context`, `-b/--batch`, `-n/--concurrency`,
 `--kv-dtype {fp16,bf16,fp8,int8,q4}`, `--os-reserve` (GB, default 8),
 `--framework` (GB, default 2), `--total-mem`, `--bandwidth`, `--efficiency` (default 0.70),
 `--engine {vllm,llama.cpp,ollama}` (per-engine efficiency and step-overhead preset),
@@ -403,9 +403,9 @@ dominant constraint for token generation.
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) and the [Code of Conduct](CODE_OF_CONDUCT.md).
+See [CONTRIBUTING.md](https://github.com/engineering87/sparkfit/blob/main/CONTRIBUTING.md) and the [Code of Conduct](https://github.com/engineering87/sparkfit/blob/main/CODE_OF_CONDUCT.md).
 Issues and pull requests are welcome.
 
 ## License
 
-[MIT](LICENSE).
+[MIT](https://github.com/engineering87/sparkfit/blob/main/LICENSE).
