@@ -209,9 +209,11 @@ def test_total_mem_negative_errors():
 
 def test_efficiency_flag_scales_tok_s(capsys):
     import json
-    sf.main(["plan", "-m", "llama3.1-8b", "-q", "q4_k_m", "--efficiency", "0.35", "--json"])
+    sf.main(["plan", "-m", "llama3.1-8b", "-q", "q4_k_m", "--efficiency", "0.35",
+             "--step-overhead-ms", "0", "--json"])
     low = json.loads(capsys.readouterr().out)["decode_tok_s"]["per_stream"]
-    sf.main(["plan", "-m", "llama3.1-8b", "-q", "q4_k_m", "--efficiency", "0.70", "--json"])
+    sf.main(["plan", "-m", "llama3.1-8b", "-q", "q4_k_m", "--efficiency", "0.70",
+             "--step-overhead-ms", "0", "--json"])
     high = json.loads(capsys.readouterr().out)["decode_tok_s"]["per_stream"]
     assert high == pytest.approx(2 * low, rel=0.02)
 
@@ -723,7 +725,8 @@ def test_cli_cluster_text(capsys):
 
 def test_doctor_calibrates_efficiency_from_measurement(capsys):
     import json
-    sf.main(["doctor", "--measured-tok-s", "6.8", "--weights-gb", "35.9", "--json"])
+    sf.main(["doctor", "--measured-tok-s", "6.8", "--weights-gb", "35.9",
+             "--step-overhead-ms", "0", "--json"])
     d = json.loads(capsys.readouterr().out)
     assert d["calibrated_efficiency"] == pytest.approx(0.894, abs=0.01)  # ~0.89 on real Spark
 
@@ -782,7 +785,8 @@ def test_load_config_ignores_unknown_and_comments(tmp_path):
 def test_doctor_bandwidth_from_env(capsys, monkeypatch):
     import json
     monkeypatch.setenv("SPARKFIT_BANDWIDTH", "136.5")  # half bandwidth -> double efficiency
-    sf.main(["doctor", "--measured-tok-s", "6.8", "--weights-gb", "35.9", "--json"])
+    sf.main(["doctor", "--measured-tok-s", "6.8", "--weights-gb", "35.9",
+             "--step-overhead-ms", "0", "--json"])
     d = json.loads(capsys.readouterr().out)
     assert d["bandwidth_gbps"] == pytest.approx(136.5)
     assert d["calibrated_efficiency"] == pytest.approx(0.894 * 2, abs=0.02)
@@ -1197,3 +1201,62 @@ def test_doctor_ttft_and_tok_s_together(tmp_path, capsys, monkeypatch):
 def test_doctor_measured_ttft_rejected(argv):
     with pytest.raises(SystemExit):
         sf.main(argv)
+
+
+# --- v0.6.0: fixed per-step decode overhead ---
+
+def test_step_overhead_slows_small_models_more():
+    small, big = sf.MODELS["qwen3-30b-a3b"], sf.MODELS["llama3.1-70b"]
+    def ratio(spec, q):
+        fast = sf.decode_tok_s(spec, q, 4096, overhead_ms=0)["per_stream"]
+        slow = sf.decode_tok_s(spec, q, 4096, overhead_ms=4)["per_stream"]
+        return slow / fast
+    assert ratio(small, "nvfp4") < 0.8        # ~10 ms steps: 4 ms is a big share
+    assert ratio(big, "fp8") > 0.95           # ~300 ms steps: 4 ms is noise
+
+
+def test_step_overhead_reported_and_engine_preset(capsys):
+    d = _json_out(capsys, ["plan", "-m", "qwen3-30b-a3b", "-q", "nvfp4", "--engine",
+                           "llama.cpp", "--json"])
+    vllm = _json_out(capsys, ["plan", "-m", "qwen3-30b-a3b", "-q", "nvfp4", "--engine",
+                              "vllm", "--json"])
+    spec = sf.MODELS["qwen3-30b-a3b"]
+    expect = sf.decode_tok_s(spec, "nvfp4", 4096, efficiency=0.55,
+                             overhead_ms=sf.ENGINE_STEP_OVERHEAD_MS["llama.cpp"])
+    assert d["decode_tok_s"]["per_stream"] == pytest.approx(expect["per_stream"], rel=0.01)
+    assert vllm["decode_tok_s"]["step_ms"] > 0
+
+
+def test_step_overhead_flag_env_and_validation(capsys, monkeypatch):
+    base = ["plan", "-m", "qwen3-30b-a3b", "-q", "nvfp4", "--json"]
+    zero = _json_out(capsys, base + ["--step-overhead-ms", "0"])["decode_tok_s"]["per_stream"]
+    monkeypatch.setenv("SPARKFIT_STEP_MS", "0")
+    env = _json_out(capsys, base)["decode_tok_s"]["per_stream"]
+    assert env == pytest.approx(zero)
+    with pytest.raises(SystemExit):
+        sf.main(base + ["--step-overhead-ms", "-1"])
+
+
+def test_qwen3_moe_vllm_estimate_in_measured_range(capsys):
+    # Published vLLM runs of ~3B-active MoE models in NVFP4 on GB10: ~47-67 tok/s.
+    d = _json_out(capsys, ["plan", "-m", "qwen3-30b-a3b", "-q", "nvfp4", "--engine", "vllm",
+                           "--json"])
+    assert 45 < d["decode_tok_s"]["per_stream"] < 80
+
+
+def test_doctor_subtracts_step_overhead(capsys):
+    base = ["doctor", "--measured-tok-s", "6.8", "--weights-gb", "35.9", "--json"]
+    raw = _json_out(capsys, base + ["--step-overhead-ms", "0"])["calibrated_efficiency"]
+    adj = _json_out(capsys, base + ["--step-overhead-ms", "4"])["calibrated_efficiency"]
+    assert adj > raw  # part of the measured step was fixed cost, not bandwidth
+    with pytest.raises(SystemExit):  # 1/500 s = 2 ms < 4 ms overhead: impossible
+        sf.main(["doctor", "--measured-tok-s", "500", "--weights-gb", "1",
+                 "--step-overhead-ms", "4"])
+
+
+def test_doctor_engine_preset_saves_step_overhead(tmp_path, capsys, monkeypatch):
+    p = str(tmp_path / "rc")
+    monkeypatch.setenv("SPARKFIT_CONFIG", p)
+    d = _json_out(capsys, ["doctor", "--engine", "llama.cpp", "--save", "--json"])
+    assert d["step_overhead_ms"] == sf.ENGINE_STEP_OVERHEAD_MS["llama.cpp"]
+    assert sf.load_config_file(p)["SPARKFIT_STEP_MS"] == str(sf.ENGINE_STEP_OVERHEAD_MS["llama.cpp"])

@@ -171,12 +171,13 @@ and `doctor` the quant detected from the model's config, else `q4_k_m`; auto in
 quick mode), `-c/--context`, `-b/--batch`, `-n/--concurrency`,
 `--kv-dtype {fp16,bf16,fp8,int8,q4}`, `--os-reserve` (GB, default 8),
 `--framework` (GB, default 2), `--total-mem`, `--bandwidth`, `--efficiency` (default 0.70),
-`--engine {vllm,llama.cpp,ollama}` (per-engine efficiency preset), `--prompt-tokens`,
+`--engine {vllm,llama.cpp,ollama}` (per-engine efficiency and step-overhead preset),
+`--step-overhead-ms` (default 4), `--prompt-tokens`,
 `--mfu`, `--compute-tflops`, `--live`, `--json`.
 For models not in the DB: `--params --active --layers --hidden --kv-heads --head-dim`.
 
 Values are checked before planning: `--efficiency` and `--mfu` must be in (0, 1],
-`--os-reserve` and `--framework` at least 0, and `--total-mem`, `--bandwidth`,
+`--os-reserve`, `--framework` and `--step-overhead-ms` at least 0, and `--total-mem`, `--bandwidth`,
 `--compute-tflops` and `--weights-gb` above 0. This also applies to values coming
 from `SPARKFIT_*` variables or the config file.
 
@@ -238,13 +239,23 @@ bandwidth actually reached:
 ```
 streams           = batch * concurrency
 bytes_per_step    = active_weights + kv_per_token * context * streams
-tok_s_aggregate   = streams * bandwidth * eff / bytes_per_step
+step_time         = bytes_per_step / (bandwidth * eff) + step_overhead
+tok_s_aggregate   = streams / step_time
 tok_s_per_stream  = tok_s_aggregate / streams
 ```
 
-Defaults: `bandwidth` 273 GB/s, `eff` 0.70. Weights are read once per step but the
-KV-cache is read for all streams, so adding concurrency raises aggregate
-throughput while each stream gets slower.
+Defaults: `bandwidth` 273 GB/s, `eff` 0.70, `step_overhead` 4 ms. Weights are read
+once per step but the KV-cache is read for all streams, so adding concurrency
+raises aggregate throughput while each stream gets slower.
+
+`step_overhead` is the fixed cost every step pays whatever the model size: kernel
+launches, sampling, scheduling and MoE routing. For a 70B model it is noise next
+to a ~300 ms step, but for a model with ~3B active parameters, whose step streams
+only a couple of GB in ~10 ms, it is a large share; without it those models were
+estimated up to 2x too fast. `--engine` sets it with the efficiency (vLLM 4 ms,
+llama.cpp 1 ms, ollama 2 ms: llama.cpp numbers usually come from `llama-bench`,
+which leaves out server overhead). Override it with `--step-overhead-ms` or
+`SPARKFIT_STEP_MS`.
 
 For a Mixture-of-Experts, `active_weights` is what the batch actually touches. A
 single stream reads only its active parameters, which is why a large MoE can be far
@@ -325,7 +336,7 @@ To calibrate efficiency, run a known model on your serving stack, note the real
 decode tok/s, and let `sparkfit doctor` do the arithmetic and save it:
 
 ```bash
-sparkfit doctor --measured-tok-s 6.8 --weights-gb 35.9 --save   # -> efficiency ~0.89
+sparkfit doctor --measured-tok-s 6.8 --weights-gb 35.9 --save   # -> efficiency ~0.92
 sparkfit doctor --engine vllm --save                            # or start from a preset
 ```
 
@@ -344,14 +355,16 @@ Both measurements can be passed in one run.
 every command reads as a default. Precedence is flag > environment variable > config
 file > built-in default, so an explicit `--efficiency` on a single run always wins.
 The file holds `key = value` lines; the recognized keys are `efficiency`,
-`bandwidth`, `os_reserve`, `framework`, `mfu` and `tflops`.
+`bandwidth`, `os_reserve`, `framework`, `mfu`, `tflops` and `step_ms`.
 
 A robust, architecture-independent shortcut is
 `efficiency ~= measured_tok_s * weights_GB / 273`, where `weights_GB` is the
 on-disk size of the weight files. Measured example: a DGX Spark serving an FP8
 model under vLLM (no other load) reached 6.8 tok/s against 35.9 GB of weights,
 i.e. about 0.89 efficiency (6.8 * 35.9 / 273), well above the conservative 0.70
-default.
+default. `doctor` also subtracts the fixed step overhead from each measured step
+before dividing, so for the same measurement it reports about 0.92; the
+difference matters only for small, fast models.
 
 ### Validation on a real DGX Spark
 

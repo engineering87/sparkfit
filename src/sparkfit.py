@@ -66,6 +66,11 @@ DEFAULT_OS_RESERVE_GB = 8.0     # DGX OS + Grace CPU side working set
 DEFAULT_FRAMEWORK_GB = 2.0      # CUDA context + serving framework overhead
 BW_EFFICIENCY = 0.70            # fraction of peak bandwidth actually reached
 DEFAULT_QUANT = "q4_k_m"        # quant used when none is given or detected
+# Fixed time per decode step on top of streaming the bytes (kernel launches,
+# sampling, scheduling, MoE routing). Fitted to published GB10 single-stream runs:
+# ~4 ms explains small/MoE models (qwen3-30b-a3b, gpt-oss) without moving 8B+
+# dense models, whose 70-80 ms steps are pure bandwidth.
+DEFAULT_STEP_OVERHEAD_MS = 4.0
 REFERENCE_FABRIC_GBPS = 200.0   # ConnectX-7 link the cluster scaling is calibrated on
 MAX_CONCURRENCY_SCAN = 256      # upper bound of `fit --concurrency-scan`
 DEFAULT_MFU = 0.30             # model-FLOPs utilization for the prefill roofline
@@ -295,7 +300,8 @@ def streamed_weight_bytes(spec: dict, quant: str, batch: int = 1,
 def decode_tok_s(spec: dict, quant: str, context: int, batch: int = 1,
                  kv_dtype: str = "fp16", bandwidth: float | None = None,
                  efficiency: float = BW_EFFICIENCY,
-                 weights_gb: float | None = None) -> dict:
+                 weights_gb: float | None = None,
+                 overhead_ms: "float | None" = DEFAULT_STEP_OVERHEAD_MS) -> dict:
     """Memory-bandwidth roofline for decode (token generation) speed.
 
     Decode is memory-bound: each step streams the weights the batch needs once (for
@@ -303,6 +309,10 @@ def decode_tok_s(spec: dict, quant: str, context: int, batch: int = 1,
     whole KV-cache. This is exactly why Spark's 273 GB/s caps tok/s.
     `weights_gb` is the measured size of the whole model; the streamed share of it
     is taken in proportion to the parameters read.
+
+    Every step also pays a fixed cost that does not shrink with the model (kernel
+    launches, sampling, scheduling, MoE routing): `overhead_ms`. It is negligible
+    for big dense models and dominant for small or few-active-parameter MoE ones.
     """
     band = bandwidth if (bandwidth and bandwidth > 0) else SPARK["bandwidth_gbps"]
     eff = efficiency if (efficiency and efficiency > 0) else BW_EFFICIENCY
@@ -310,9 +320,12 @@ def decode_tok_s(spec: dict, quant: str, context: int, batch: int = 1,
     w_active = streamed_weight_bytes(spec, quant, batch, weights_gb)
     kv_step = kv_per_token_bytes(spec, kv_dtype) * effective_context(spec, context) * batch
     bytes_per_step = max(w_active + kv_step, 1.0)
-    agg = batch * bw / bytes_per_step      # aggregate tokens/s across the batch
+    fixed_s = max(overhead_ms or 0.0, 0.0) / 1000.0
+    step_s = bytes_per_step / bw + fixed_s
+    agg = batch / step_s                   # aggregate tokens/s across the batch
     per = agg / batch if batch else 0.0    # tokens/s seen by one stream
-    return {"aggregate": agg, "per_stream": per, "bytes_per_step": bytes_per_step}
+    return {"aggregate": agg, "per_stream": per, "bytes_per_step": bytes_per_step,
+            "step_ms": step_s * 1000.0}
 
 
 def prefill_flops(spec: dict, prompt_tokens: int) -> float:
@@ -481,10 +494,14 @@ def add_model_flags(p: argparse.ArgumentParser) -> None:
 CONFIG_ENV = "SPARKFIT_CONFIG"
 DEFAULT_CONFIG_PATH = os.path.expanduser("~/.sparkfitrc")
 ENGINE_EFFICIENCY = {"vllm": 0.85, "llama.cpp": 0.55, "ollama": 0.50}
+# Per-step fixed cost by engine. Server-side numbers (vLLM) include scheduling and
+# sampling; llama.cpp figures usually come from llama-bench, which has almost none.
+ENGINE_STEP_OVERHEAD_MS = {"vllm": 4.0, "llama.cpp": 1.0, "ollama": 2.0}
 # friendly config key -> the SPARKFIT_* name the flags already read as defaults.
 _CONFIG_KEYS = {"efficiency": "SPARKFIT_EFFICIENCY", "bandwidth": "SPARKFIT_BANDWIDTH",
                 "os_reserve": "SPARKFIT_OS_RESERVE", "framework": "SPARKFIT_FRAMEWORK",
-                "mfu": "SPARKFIT_MFU", "tflops": "SPARKFIT_TFLOPS"}
+                "mfu": "SPARKFIT_MFU", "tflops": "SPARKFIT_TFLOPS",
+                "step_ms": "SPARKFIT_STEP_MS"}
 
 
 def config_path() -> str:
@@ -585,7 +602,9 @@ def add_workload_flags(p: argparse.ArgumentParser) -> None:
     p.add_argument("--efficiency", type=float, default=None,
                    help="fraction of peak bandwidth reached, 0..1 (default 0.70; calibrate with doctor)")
     p.add_argument("--engine", choices=list(ENGINE_EFFICIENCY), default=None,
-                   help="apply a per-engine bandwidth-efficiency preset for this run")
+                   help="apply a per-engine efficiency + step-overhead preset for this run")
+    p.add_argument("--step-overhead-ms", type=float, default=None,
+                   help="fixed ms per decode step (default 4; engine preset with --engine)")
     p.add_argument("--prompt-tokens", type=_positive_int, default=None,
                    help="prompt length for the prefill/TTFT estimate (default: context)")
     p.add_argument("--mfu", type=float, default=_envf("SPARKFIT_MFU", DEFAULT_MFU),
@@ -974,14 +993,15 @@ def cmd_quick(args: argparse.Namespace) -> None:
         bd = budget(spec, qz0, ctx, 1, conc, args.kv_dtype, args.os_reserve,
                     args.framework, args.total_mem, weights_gb=weights_gb)
         tp = decode_tok_s(spec, qz0, ctx, conc, args.kv_dtype, args.bandwidth,
-                          args.efficiency, weights_gb=weights_gb)
+                          args.efficiency, overhead_ms=args.step_overhead_ms,
+                          weights_gb=weights_gb)
         compute_quant = qz0
     else:
         auto = first_fit = None
         for qz in QUANT_LADDER:
             b = budget(spec, qz, ctx, 1, conc, args.kv_dtype, args.os_reserve,
                        args.framework, args.total_mem)
-            t = decode_tok_s(spec, qz, ctx, conc, args.kv_dtype, args.bandwidth, args.efficiency)
+            t = decode_tok_s(spec, qz, ctx, conc, args.kv_dtype, args.bandwidth, args.efficiency, overhead_ms=args.step_overhead_ms)
             ladder.append((qz, b, t))
             if b["fits"]:
                 if first_fit is None:
@@ -992,7 +1012,7 @@ def cmd_quick(args: argparse.Namespace) -> None:
                   or auto or first_fit or QUANT_LADDER[-1])
         bd = budget(spec, chosen, ctx, 1, conc, args.kv_dtype, args.os_reserve,
                     args.framework, args.total_mem)
-        tp = decode_tok_s(spec, chosen, ctx, conc, args.kv_dtype, args.bandwidth, args.efficiency)
+        tp = decode_tok_s(spec, chosen, ctx, conc, args.kv_dtype, args.bandwidth, args.efficiency, overhead_ms=args.step_overhead_ms)
         compute_quant = chosen
 
     pf = prefill_stats(spec, compute_quant, args.prompt_tokens or ctx, args.bandwidth,
@@ -1081,7 +1101,7 @@ def cmd_plan(args: argparse.Namespace) -> None:
                 args.kv_dtype, args.os_reserve, args.framework, args.total_mem,
                 weights_gb=args.weights_gb)
     tp = decode_tok_s(spec, args.quant, args.context, args.batch * args.concurrency,
-                      args.kv_dtype, args.bandwidth, args.efficiency,
+                      args.kv_dtype, args.bandwidth, args.efficiency, overhead_ms=args.step_overhead_ms,
                       weights_gb=args.weights_gb)
     pf = prefill_stats(spec, args.quant, args.prompt_tokens or args.context,
                        args.bandwidth, args.efficiency, args.compute_tflops, args.mfu,
@@ -1133,7 +1153,7 @@ def cmd_advise(args: argparse.Namespace) -> None:
         bd = budget(spec, q, args.context, args.batch, args.concurrency,
                     args.kv_dtype, args.os_reserve, args.framework, args.total_mem)
         tp = decode_tok_s(spec, q, args.context, args.batch * args.concurrency,
-                          args.kv_dtype, args.bandwidth, args.efficiency)
+                          args.kv_dtype, args.bandwidth, args.efficiency, overhead_ms=args.step_overhead_ms)
         margin = bd["free"] / bd["total"]
         results.append((q, bd, tp, margin))
 
@@ -1194,7 +1214,7 @@ def cmd_fit(args: argparse.Namespace) -> None:
             if not bd["fits"]:
                 break
             tp = decode_tok_s(spec, args.quant, args.context, args.batch * n,
-                              args.kv_dtype, args.bandwidth, args.efficiency)
+                              args.kv_dtype, args.bandwidth, args.efficiency, overhead_ms=args.step_overhead_ms)
             rows.append((n, bd, tp))
             n += 1
         max_n = rows[-1][0] if rows else 0
@@ -1231,7 +1251,7 @@ def cmd_fit(args: argparse.Namespace) -> None:
         bd = budget(spec, args.quant, args.context, args.batch, args.concurrency,
                     args.kv_dtype, args.os_reserve, args.framework, args.total_mem)
         tp = decode_tok_s(spec, args.quant, args.context, args.batch * args.concurrency,
-                          args.kv_dtype, args.bandwidth, args.efficiency)
+                          args.kv_dtype, args.bandwidth, args.efficiency, overhead_ms=args.step_overhead_ms)
         fitting.append((name, base["total_b"], bd, tp))
     fitting.sort(key=lambda r: r[1], reverse=True)
 
@@ -1314,7 +1334,8 @@ def cmd_serve(args: argparse.Namespace) -> None:
         kv = kv_total_bytes(spec, ctx, streams, args.kv_dtype)
         act = activation_bytes(spec, ctx, streams)
         alone = decode_tok_s(spec, quant, ctx, streams, args.kv_dtype, args.bandwidth,
-                             args.efficiency, weights_gb=wgb)["per_stream"]
+                             args.efficiency, overhead_ms=args.step_overhead_ms,
+                             weights_gb=wgb)["per_stream"]
         pf = prefill_stats(spec, quant, args.prompt_tokens or ctx, args.bandwidth,
                            args.efficiency, args.compute_tflops, args.mfu, weights_gb=wgb,
                            engine=args.engine)
@@ -1407,7 +1428,8 @@ def cmd_cluster(args: argparse.Namespace) -> None:
     fits = per_node_used <= node_total
 
     one = decode_tok_s(spec, quant, args.context, streams, args.kv_dtype,
-                       args.bandwidth, args.efficiency, weights_gb=weights_gb)
+                       args.bandwidth, args.efficiency, overhead_ms=args.step_overhead_ms,
+                       weights_gb=weights_gb)
     # A slower fabric lowers the gain; a faster one cannot push past the per-node
     # scaling factor, so N nodes never exceed N x one node.
     fabric_factor = min(args.fabric_gbps / REFERENCE_FABRIC_GBPS, 1.0)
@@ -1481,7 +1503,8 @@ def _effective_settings() -> dict:
             "os_reserve": _envf("SPARKFIT_OS_RESERVE", DEFAULT_OS_RESERVE_GB),
             "framework": _envf("SPARKFIT_FRAMEWORK", DEFAULT_FRAMEWORK_GB),
             "mfu": _envf("SPARKFIT_MFU", DEFAULT_MFU),
-            "tflops": _envf("SPARKFIT_TFLOPS", SPARK["fp16_tflops"])}
+            "tflops": _envf("SPARKFIT_TFLOPS", SPARK["fp16_tflops"]),
+            "step_ms": _envf("SPARKFIT_STEP_MS", DEFAULT_STEP_OVERHEAD_MS)}
 
 
 def _doctor_calibrate(args: argparse.Namespace, band: float) -> None:
@@ -1512,11 +1535,19 @@ def _doctor_calibrate(args: argparse.Namespace, band: float) -> None:
             bytes_step = wgb * GB
         else:
             raise SystemExit("doctor --measured-tok-s needs --model or --weights-gb.")
-        eff = tok_s * bytes_step / (band * 1e9)
+        # The measured step = bytes / (bandwidth * eff) + fixed overhead.
+        overhead_s = (args.step_overhead_ms or 0.0) / 1000.0
+        stream_s = 1.0 / tok_s - overhead_s
+        if stream_s <= 0:
+            raise SystemExit(
+                f"{tok_s:.1f} tok/s is faster than the {overhead_s * 1000:.1f} ms fixed step "
+                "overhead allows; lower --step-overhead-ms.")
+        eff = bytes_step / (band * 1e9 * stream_s)
         updates["efficiency"] = round(min(eff, 1.0), 3)  # never persist an efficiency > 1.0
-        out.update({"calibrated_efficiency": round(eff, 3), "measured_tok_s": tok_s})
+        out.update({"calibrated_efficiency": round(eff, 3), "measured_tok_s": tok_s,
+                    "step_overhead_ms": args.step_overhead_ms})
         lines.append(f"  measured {tok_s:.1f} tok/s on ~{bytes_step / GB:.1f} GB per step "
-                     f"at {band:.0f} GB/s")
+                     f"at {band:.0f} GB/s (+{overhead_s * 1000:.1f} ms fixed per step)")
         lines.append("  -> bandwidth efficiency " + bold(f"{eff:.2f}")
                      + dim(f"  (default is {BW_EFFICIENCY:.2f})"))
         if eff > 1.0:
@@ -1589,15 +1620,18 @@ def cmd_doctor(args: argparse.Namespace) -> None:
 
     if args.engine:
         eff = ENGINE_EFFICIENCY[args.engine]
-        saved = write_config({"efficiency": eff}) if args.save else None
+        step_ms = ENGINE_STEP_OVERHEAD_MS[args.engine]
+        saved = (write_config({"efficiency": eff, "step_ms": step_ms})
+                 if args.save else None)
         if args.json:
             print(json.dumps({"engine": args.engine, "efficiency": eff,
-                              "saved_to": saved}, indent=2))
+                              "step_overhead_ms": step_ms, "saved_to": saved}, indent=2))
             return
         print()
         print(bold("  sparkfit doctor  |  engine preset"))
         print()
-        print(f"  {args.engine}: starting bandwidth efficiency " + bold(f"{eff:.2f}"))
+        print(f"  {args.engine}: starting bandwidth efficiency " + bold(f"{eff:.2f}")
+              + f", fixed step overhead {bold(f'{step_ms:.1f} ms')}")
         print(dim("  (vLLM captures CUDA graphs and uses FP4 GEMM; llama.cpp/ollama "
                   "dequantize GGUF, so they reach less of peak bandwidth)"))
         print()
@@ -1630,6 +1664,7 @@ def cmd_doctor(args: argparse.Namespace) -> None:
     print(f"    framework    {settings['framework']:.0f} GB")
     print(f"    mfu          {settings['mfu']:.2f}")
     print(f"    tflops       {settings['tflops']:.0f} (dense BF16)")
+    print(f"    step         {settings['step_ms']:.1f} ms fixed per decode step")
     print()
     cp = config_path()
     print(dim(f"  config: {cp} ({'loaded' if os.path.isfile(cp) else 'not found'})"))
@@ -1794,6 +1829,8 @@ def build_parser() -> argparse.ArgumentParser:
     dr.add_argument("--engine", choices=list(ENGINE_EFFICIENCY),
                     help="alone: start from a per-engine efficiency default; with "
                          "--measured-ttft: the engine that was measured")
+    dr.add_argument("--step-overhead-ms", type=float, default=None,
+                    help="fixed ms per decode step (default 4; engine preset with --engine)")
     dr.add_argument("--save", action="store_true",
                     help="write the value to the config file (~/.sparkfitrc)")
     dr.add_argument("--json", action="store_true")
@@ -1819,6 +1856,8 @@ def build_parser() -> argparse.ArgumentParser:
     qk.add_argument("--bandwidth", type=float, default=_envf("SPARKFIT_BANDWIDTH", None))
     qk.add_argument("--efficiency", type=float, default=None)
     qk.add_argument("--engine", choices=list(ENGINE_EFFICIENCY), default=None)
+    qk.add_argument("--step-overhead-ms", type=float, default=None,
+                    help="fixed ms per decode step (default 4; engine preset with --engine)")
     qk.add_argument("--prompt-tokens", type=_positive_int, default=None)
     qk.add_argument("--mfu", type=float, default=_envf("SPARKFIT_MFU", DEFAULT_MFU))
     qk.add_argument("--compute-tflops", type=float, default=_envf("SPARKFIT_TFLOPS", None))
@@ -1873,6 +1912,8 @@ def validate_args(args: argparse.Namespace) -> None:
     _check_range(args, "bandwidth", "--bandwidth")
     _check_range(args, "compute_tflops", "--compute-tflops")
     _check_range(args, "weights_gb", "--weights-gb")
+    _check_range(args, "step_overhead_ms", "--step-overhead-ms (or SPARKFIT_STEP_MS)",
+                 inclusive_low=True)
     _check_range(args, "fabric_gbps", "--fabric-gbps")
     _check_range(args, "scaling", "--scaling", high=1.0, inclusive_low=True)
 
@@ -1894,6 +1935,10 @@ def main(argv: list[str] | None = None) -> None:
     if hasattr(args, "efficiency") and args.efficiency is None:
         eng = getattr(args, "engine", None)
         args.efficiency = ENGINE_EFFICIENCY[eng] if eng else _envf("SPARKFIT_EFFICIENCY", BW_EFFICIENCY)
+    if hasattr(args, "step_overhead_ms") and args.step_overhead_ms is None:
+        eng = getattr(args, "engine", None)
+        args.step_overhead_ms = (ENGINE_STEP_OVERHEAD_MS[eng] if eng
+                                 else _envf("SPARKFIT_STEP_MS", DEFAULT_STEP_OVERHEAD_MS))
     validate_args(args)
     args.func(args)
 

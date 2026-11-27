@@ -14,6 +14,15 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   before, ~260 now, versus ~350-700 measured depending on how it is counted).
   Built-in MoE models carry `n_experts`/`top_k`, Hugging Face configs provide
   them, and custom models take `--experts` and `--top-k`.
+- Decode adds a fixed cost per step (kernel launches, sampling, scheduling, MoE
+  routing) on top of streaming the bytes: 4 ms by default, `--step-overhead-ms` /
+  `SPARKFIT_STEP_MS` / `step_ms` in the config, and an `--engine` preset (vLLM 4,
+  llama.cpp 1, ollama 2). Small and few-active-parameter MoE models were estimated
+  up to 2x too fast (qwen3-30b-a3b NVFP4 on vLLM: ~105 tok/s before, ~74 now,
+  ~47-67 measured); 8B+ dense models barely move. JSON output reports `step_ms`.
+  `doctor --measured-tok-s` subtracts it before backing out the efficiency (the
+  README example now calibrates to ~0.92 instead of ~0.89), and
+  `doctor --engine --save` saves it with the efficiency.
 - `doctor --measured-ttft SECONDS` (with `--model`, `--prompt-tokens`, `--engine`)
   backs out the prefill MFU from a measured time-to-first-token and can save it.
   It can be combined with `--measured-tok-s` in one run, and refuses to save an
