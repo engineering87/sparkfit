@@ -6,6 +6,8 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-27
+
 ### Added
 - MoE batched decode models expert coverage: with B tokens per step, a model with E
   routed experts and top-k routing reads about `E * (1 - (1 - k/E)^B)` distinct
@@ -251,7 +253,8 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Packaged for pip and pipx with a `sparkfit` console entry point; also usable as
   a single standalone script.
 
-[Unreleased]: https://github.com/engineering87/sparkfit/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/engineering87/sparkfit/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/engineering87/sparkfit/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/engineering87/sparkfit/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/engineering87/sparkfit/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/engineering87/sparkfit/compare/v0.2.0...v0.3.0
